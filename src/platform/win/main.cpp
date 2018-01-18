@@ -1,5 +1,8 @@
 #ifdef _DEBUG
+    #define _CRTDBG_MAP_ALLOC
     #include "crtdbg.h"
+    #define DEBUG_NEW new(_NORMAL_BLOCK, __FILE__, __LINE__)
+    #define new DEBUG_NEW
 #endif
 
 #ifdef MINIMAL
@@ -13,7 +16,9 @@
 
 #include "game.h"
 
-int getTime() {
+int osStartTime = 0;
+
+int osGetTime() {
 #ifdef DEBUG
     LARGE_INTEGER Freq, Count;
     QueryPerformanceFrequency(&Freq);
@@ -21,14 +26,22 @@ int getTime() {
     return int(Count.QuadPart * 1000L / Freq.QuadPart);
 #else
     timeBeginPeriod(0);
-    return int(timeGetTime());
+    return int(timeGetTime()) - osStartTime;
 #endif
+}
+
+bool osSave(const char *name, const void *data, int size) {
+    FILE *f = fopen(name, "wb");
+    if (!f) return false;
+    fwrite(data, size, 1, f);
+    fclose(f);
+    return true;
 }
 
 // common input functions
 InputKey keyToInputKey(int code) {
     static const int codes[] = {
-        VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN, VK_SPACE, VK_RETURN, VK_ESCAPE, VK_SHIFT, VK_CONTROL, VK_MENU,
+        VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN, VK_SPACE, VK_TAB, VK_RETURN, VK_ESCAPE, VK_SHIFT, VK_CONTROL, VK_MENU,
         '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
         'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M',
         'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
@@ -168,7 +181,6 @@ void touchUpdate(HWND hWnd, HTOUCHINPUT hTouch, int count) {
 
 bool sndReady;
 char *sndData;
-CRITICAL_SECTION sndCS;
 HWAVEOUT waveOut;
 WAVEFORMATEX waveFmt = { WAVE_FORMAT_PCM, 2, 44100, 44100 * 4, 4, 16, sizeof(waveFmt) };
 WAVEHDR waveBuf[2];
@@ -176,41 +188,30 @@ WAVEHDR waveBuf[2];
 void sndFree() {
     if (!sndReady) return;
     sndReady = false;
-    EnterCriticalSection(&sndCS);
     waveOutUnprepareHeader(waveOut, &waveBuf[0], sizeof(WAVEHDR));
     waveOutUnprepareHeader(waveOut, &waveBuf[1], sizeof(WAVEHDR));
     waveOutReset(waveOut);
     waveOutClose(waveOut);
     delete[] sndData;
-    LeaveCriticalSection(&sndCS);
-    DeleteCriticalSection(&sndCS);
 }
 
-void CALLBACK sndFill(HWAVEOUT waveOut, UINT uMsg, DWORD_PTR dwInstance, LPWAVEHDR waveBuf, DWORD dwParam2) {
+void sndFill(HWAVEOUT waveOut, LPWAVEHDR waveBuf) {
     if (!sndReady) return;
-    if (uMsg == MM_WOM_CLOSE) {
-        sndFree();
-        return;
-    }
-
-    EnterCriticalSection(&sndCS);
     waveOutUnprepareHeader(waveOut, waveBuf, sizeof(WAVEHDR));
     Sound::fill((Sound::Frame*)waveBuf->lpData, SND_SIZE / 4);
     waveOutPrepareHeader(waveOut, waveBuf, sizeof(WAVEHDR));
     waveOutWrite(waveOut, waveBuf, sizeof(WAVEHDR));
-    LeaveCriticalSection(&sndCS);
 }
 
 void sndInit(HWND hwnd) {
-    InitializeCriticalSection(&sndCS);
-    if (waveOutOpen(&waveOut, WAVE_MAPPER, &waveFmt, (INT_PTR)sndFill, 0, CALLBACK_FUNCTION) == MMSYSERR_NOERROR) {
+    if (waveOutOpen(&waveOut, WAVE_MAPPER, &waveFmt, (INT_PTR)hwnd, 0, CALLBACK_WINDOW) == MMSYSERR_NOERROR) {
         sndReady = true;
         sndData  = new char[SND_SIZE * 2];
         memset(&waveBuf, 0, sizeof(waveBuf));
         for (int i = 0; i < 2; i++) {
             waveBuf[i].dwBufferLength = SND_SIZE;
             waveBuf[i].lpData = sndData + SND_SIZE * i;
-            sndFill(waveOut, 0, 0, &waveBuf[i], 0);
+            sndFill(waveOut, &waveBuf[i]);
         }
     } else {
         sndReady = false;
@@ -291,6 +292,10 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_TOUCH :
             touchUpdate(hWnd, (HTOUCHINPUT)lParam, wParam);
             break;
+        // sound
+        case MM_WOM_DONE :
+            sndFill((HWAVEOUT)wParam, (WAVEHDR*)lParam);
+            break;
         default :
             return DefWindowProc(hWnd, msg, wParam, lParam);
     }
@@ -300,11 +305,16 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 HGLRC initGL(HDC hDC) {
     PIXELFORMATDESCRIPTOR pfd;
     memset(&pfd, 0, sizeof(pfd));
-    pfd.nSize      = sizeof(pfd);
-    pfd.nVersion   = 1;
-    pfd.dwFlags    = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
-    pfd.cColorBits = 32;
-    pfd.cDepthBits = 24;
+    pfd.nSize        = sizeof(pfd);
+    pfd.nVersion     = 1;
+    pfd.dwFlags      = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+    pfd.cColorBits   = 32;
+    pfd.cRedBits     = 8;
+    pfd.cGreenBits   = 8;
+    pfd.cBlueBits    = 8;
+    pfd.cAlphaBits   = 8;
+    pfd.cDepthBits   = 24;
+    pfd.cStencilBits = 8;
 
     int format = ChoosePixelFormat(hDC, &pfd);
     SetPixelFormat(hDC, format, &pfd);
@@ -323,10 +333,10 @@ char Stream::contentDir[255];
 
 #ifdef _DEBUG
 int main(int argc, char** argv) {
-    _CrtMemState _ms;
-    _CrtMemCheckpoint(&_ms);
+    _CrtMemState _msBegin, _msEnd, _msDiff;
     _CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_FILE);
     _CrtSetReportFile(_CRT_WARN, _CRTDBG_FILE_STDOUT);
+    _CrtMemCheckpoint(&_msBegin);
 //#elif PROFILE
 #else
 int main(int argc, char** argv) {
@@ -349,6 +359,8 @@ int main(int argc, char** argv) {
     
     Sound::channelsCount = 0;
 
+    osStartTime = osGetTime();
+
     touchInit(hWnd);
     joyInit();
     sndInit(hWnd);
@@ -361,43 +373,40 @@ int main(int argc, char** argv) {
     SetWindowLong(hWnd, GWL_WNDPROC, (LONG)&WndProc);
     ShowWindow(hWnd, SW_SHOWDEFAULT);
 
-    DWORD lastTime = getTime();
     MSG msg;
 
-    do {
+    while (!Core::isQuit) {
         if (PeekMessage(&msg, 0, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
             DispatchMessage(&msg);
+            if (msg.message == WM_QUIT)
+                Core::quit();
         } else {
             joyUpdate();
-
-            DWORD time = getTime();
-            if (time <= lastTime)
-                continue;
-
-            EnterCriticalSection(&sndCS);
-            Game::update((time - lastTime) * 0.001f);
-            LeaveCriticalSection(&sndCS);
-            lastTime = time;
-
-            Game::render();
-            SwapBuffers(hDC);
+            if (Game::update()) {
+                Game::render();
+                SwapBuffers(hDC);
+            }
             #ifdef _DEBUG
                 Sleep(20);
             #endif
         }
-    } while (msg.message != WM_QUIT);
+    };
 
     sndFree();
-    Game::free();
+    Game::deinit();
 
     freeGL(hRC);
     ReleaseDC(hWnd, hDC);
 
     DestroyWindow(hWnd);
  #ifdef _DEBUG
-    _CrtMemDumpAllObjectsSince(&_ms);
-    system("pause");
+    _CrtMemCheckpoint(&_msEnd);
+
+    if (_CrtMemDifference(&_msDiff, &_msBegin, &_msEnd) > 0) {
+        _CrtDumpMemoryLeaks();
+        system("pause");
+    }
 #endif
 
     return 0;

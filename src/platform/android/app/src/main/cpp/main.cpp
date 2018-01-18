@@ -10,42 +10,51 @@
   JNIEXPORT return_type JNICALL              \
       Java_org_xproger_openlara_Wrapper_##method_name
 
-int getTime() {
-    timeval time;
-    gettimeofday(&time, NULL);
-    return (time.tv_sec * 1000) + (time.tv_usec / 1000);
+time_t startTime;
+
+int osGetTime() {
+    timeval t;
+    gettimeofday(&t, NULL);
+    return int((t.tv_sec - startTime) * 1000 + t.tv_usec / 1000);
+}
+
+bool osSave(const char *name, const void *data, int size) {
+    return false;
 }
 
 extern "C" {
 
-int lastTime;
-
 char Stream::cacheDir[255];
 char Stream::contentDir[255];
 
-JNI_METHOD(void, nativeInit)(JNIEnv* env, jobject obj, jstring packName, jstring cacheDir, jint levelOffset, jint musicOffset) {
+JNI_METHOD(void, nativeInit)(JNIEnv* env, jobject obj, jstring contentDir, jstring cacheDir, jstring packName, jint levelOffset) {
+    timeval t;
+    gettimeofday(&t, NULL);
+    startTime = t.tv_sec;	
+
     const char* str;
 
     Stream::contentDir[0] = Stream::cacheDir[0] = 0;
+
+    str = env->GetStringUTFChars(packName, NULL);
+/*
+    Stream *level = new Stream(str);
+    env->ReleaseStringUTFChars(packName, str);
+    level->seek(levelOffset);
+*/
+    str = env->GetStringUTFChars(contentDir, NULL);
+    strcat(Stream::contentDir, str);
+    env->ReleaseStringUTFChars(contentDir, str);
+
     str = env->GetStringUTFChars(cacheDir, NULL);
     strcat(Stream::cacheDir, str);
     env->ReleaseStringUTFChars(cacheDir, str);
 
-    str = env->GetStringUTFChars(packName, NULL);
-    Stream *level = new Stream(str);
-    Stream *music = new Stream(str);
-    env->ReleaseStringUTFChars(packName, str);
-
-    level->seek(levelOffset);
-    music->seek(musicOffset);
-
-    Game::init(level, music);
-
-    lastTime    = getTime();
+    Game::init();
 }
 
 JNI_METHOD(void, nativeFree)(JNIEnv* env) {
-    Game::free();
+    Game::deinit();
 }
 
 JNI_METHOD(void, nativeReset)(JNIEnv* env) {
@@ -53,11 +62,7 @@ JNI_METHOD(void, nativeReset)(JNIEnv* env) {
 }
 
 JNI_METHOD(void, nativeUpdate)(JNIEnv* env) {
-    int time = getTime();
-    if (time == lastTime)
-        return;
-    Game::update((time - lastTime) * 0.001f);
-    lastTime = time;
+    Game::update();
 }
 
 JNI_METHOD(void, nativeRender)(JNIEnv* env) {
@@ -98,7 +103,7 @@ int getPOV(int x, int y) {
 
 InputKey keyToInputKey(int code) {
     int codes[] = {
-        21, 22, 19, 20, 62, 66, 111, 59, 113, 57,
+        21, 22, 19, 20, 62, 61, 66, 111, 59, 113, 57,
         7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
         29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41,
         42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54,

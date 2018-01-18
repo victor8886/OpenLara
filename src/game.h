@@ -3,46 +3,74 @@
 
 #include "core.h"
 #include "format.h"
+#include "cache.h"
 #include "level.h"
 #include "ui.h"
 
-namespace Game {
-    Level *level;
-    UI    *ui;
+ShaderCache *shaderCache;
 
-    void startLevel(Stream *lvl, Stream *snd, bool demo, bool home) {
-        delete ui;
+namespace Game {
+    Level  *level;
+    Stream *nextLevel;
+}
+
+void loadAsync(Stream *stream, void *userData) {
+    if (!stream) {
+        if (Game::level) Game::level->isEnded = false;
+        return;
+    }
+    Game::nextLevel = stream;
+}
+
+namespace Game {
+    void startLevel(Stream *lvl) {
         delete level;
-        level = new Level(*lvl, snd, demo, home);
-        ui    = new UI(level);
+        level = new Level(*lvl);
+        UI::game = level;
         delete lvl;
     }
 
-    void init(Stream *lvl, Stream *snd) {
+    void stopChannel(Sound::Sample *channel) {
+        if (level) level->stopChannel(channel);
+    }
+
+    void init(Stream *lvl) {
+        nextLevel = NULL;
+
         Core::init();
 
-        Core::settings.ambient  = true;
-        Core::settings.lighting = true;
-        Core::settings.shadows  = true;
-        Core::settings.water    = Core::support.texFloat || Core::support.texHalf;
+        shaderCache = new ShaderCache();
+
+        UI::init(level);
+
+        Sound::callback = stopChannel;
 
         level = NULL;
-        ui    = NULL;
-        startLevel(lvl, snd, false, false);
+        startLevel(lvl);
     }
 
     void init(char *lvlName = NULL, char *sndName = NULL) {
-        if (!lvlName) lvlName = (char*)"LEVEL2.PSX";
-        #ifndef __EMSCRIPTEN__  
-            if (!sndName) sndName = (char*)"05.ogg";
-        #endif
-        init(new Stream(lvlName), sndName ? new Stream(sndName) : NULL);
+        char fileName[255];
+
+        TR::Version version = TR::getGameVersion();
+        if (!lvlName && version != TR::VER_UNKNOWN) {
+            lvlName = fileName;
+            TR::getGameLevelFile(lvlName, version, TR::getTitleId(version));
+        }
+
+        if (!lvlName) {
+            lvlName = fileName;
+            strcpy(lvlName, "level/1/TITLE.PSX");
+        }
+
+        init(new Stream(lvlName));
     }
 
-    void free() {
-        delete ui;
+    void deinit() {
         delete level;
-        Core::free();
+        UI::deinit();
+        delete shaderCache;
+        Core::deinit();
     }
 
     void updateTick() {
@@ -59,27 +87,67 @@ namespace Game {
         Core::deltaTime = dt;
     }
 
-    void update(float delta) {
-        if (Input::down[ikV]) { // third <-> first person view
-            level->camera->changeView(!level->camera->firstPerson);
-            Input::down[ikV] = false;
+    bool update() {
+        PROFILE_MARKER("UPDATE");
+
+        if (!Core::update())
+            return false;
+
+        float delta = Core::deltaTime;
+
+        if (nextLevel) {
+            startLevel(nextLevel);
+            nextLevel = NULL;
         }
 
-        Core::deltaTime = delta = min(1.0f, delta);
-        ui->update();
+        if (level->isEnded)
+            return true;
+
+        Input::update();
+
+        if (level->camera) {
+            if (Input::down[ikV]) { // third <-> first person view
+                level->camera->changeView(!level->camera->firstPerson);
+                Input::down[ikV] = false;
+            }
+        }
+
+        if (Input::down[ikS]) {
+            if (level->lara->canSaveGame())
+                level->saveGame(0);
+            Input::down[ikS] = false;
+        }
+
+        if (Input::down[ikL]) {
+            level->loadGame(0);
+            Input::down[ikL] = false;
+        }
+
+        if (!level->level.isCutsceneLevel())
+            delta = min(0.2f, delta);
 
         while (delta > EPS) {
             Core::deltaTime = min(delta, 1.0f / 30.0f);
             Game::updateTick();
             delta -= Core::deltaTime;
+            if (Core::resetState) // resetTime was called
+                break;
         }
+
+        return true;
     }
 
     void render() {
+        PROFILE_MARKER("RENDER");
         PROFILE_TIMING(Core::stats.tFrame);
         Core::beginFrame();
         level->render();
-        ui->renderTouch();
+        UI::renderTouch();
+
+        #ifdef _DEBUG
+            level->renderDebug();
+        #endif
+
         Core::endFrame();
     }
 }

@@ -1,0 +1,82 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="main.cpp" />
+    <ClCompile Include="..\..\libs\minimp3\minimp3.cpp">
+      <Filter>libs\minimp3</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\libs\stb_vorbis\stb_vorbis.c">
+      <Filter>libs\stb_vorbis</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\libs\tinf\tinflate.c">
+      <Filter>libs\tinf</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\..\animation.h" />
+    <ClInclude Include="..\..\cache.h" />
+    <ClInclude Include="..\..\camera.h" />
+    <ClInclude Include="..\..\character.h" />
+    <ClInclude Include="..\..\collision.h" />
+    <ClInclude Include="..\..\controller.h" />
+    <ClInclude Include="..\..\core.h" />
+    <ClInclude Include="..\..\debug.h" />
+    <ClInclude Include="..\..\enemy.h" />
+    <ClInclude Include="..\..\frustum.h" />
+    <ClInclude Include="..\..\game.h" />
+    <ClInclude Include="..\..\ui.h" />
+    <ClInclude Include="..\..\input.h" />
+    <ClInclude Include="..\..\inventory.h" />
+    <ClInclude Include="..\..\lara.h" />
+    <ClInclude Include="..\..\level.h" />
+    <ClInclude Include="..\..\mesh.h" />
+    <ClInclude Include="..\..\shader.h" />
+    <ClInclude Include="..\..\sound.h" />
+    <ClInclude Include="..\..\sprite.h" />
+    <ClInclude Include="..\..\texture.h" />
+    <ClInclude Include="..\..\format.h" />
+    <ClInclude Include="..\..\trigger.h" />
+    <ClInclude Include="..\..\utils.h" />
+    <ClInclude Include="..\..\libs\minimp3\minimp3.h">
+      <Filter>libs\minimp3</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\libs\minimp3\libc.h">
+      <Filter>libs\minimp3</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\gameflow.h" />
+    <ClInclude Include="..\..\libs\tinf\tinf.h">
+      <Filter>libs\tinf</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="..\..\shaders\filter.glsl">
+      <Filter>shaders</Filter>
+    </None>
+    <None Include="..\..\shaders\gui.glsl">
+      <Filter>shaders</Filter>
+    </None>
+    <None Include="..\..\shaders\shader.glsl">
+      <Filter>shaders</Filter>
+    </None>
+    <None Include="..\..\shaders\water.glsl">
+      <Filter>shaders</Filter>
+    </None>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="shaders">
+      <UniqueIdentifier>{3fcb6c00-268a-4570-b6ca-3bf1cf1e10d7}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="libs">
+      <UniqueIdentifier>{0400c04a-7900-49a2-9b9d-6667d815168c}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="libs\minimp3">
+      <UniqueIdentifier>{bc55e021-2a62-4bc1-8b80-0fd900f20b2b}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="libs\stb_vorbis">
+      <UniqueIdentifier>{f26df5a9-d32a-4e5e-948c-e632c42be9fa}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="libs\tinf">
+      <UniqueIdentifier>{80edb27c-40cf-4f7a-a854-88eeba24a5fb}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

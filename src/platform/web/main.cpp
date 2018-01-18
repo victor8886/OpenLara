@@ -3,22 +3,31 @@
 
 #include "game.h"
 
-int lastTime, lastJoy = -1;
+int lastJoy = -1;
 EGLDisplay display;
 EGLSurface surface;
 EGLContext context;
 
-int getTime() {
+int osGetTime() {
     return (int)emscripten_get_now();
+}
+
+bool osSave(const char *name, const void *data, int size) {
+// TODO cookie? idb?
+    FILE *f = fopen(name, "wb");
+    if (!f) return false;
+    fwrite(data, size, 1, f);
+    fclose(f);
+    return true;
 }
 
 extern "C" {
     void EMSCRIPTEN_KEEPALIVE snd_fill(Sound::Frame *frames, int count) {
-		Sound::fill(frames, count);		
+        Sound::fill(frames, count);
     }
     
-    void EMSCRIPTEN_KEEPALIVE game_level_load(char *data, int size, int home) {
-        Game::startLevel(new Stream(data, size), NULL, false, home);
+    void EMSCRIPTEN_KEEPALIVE game_level_load(char *data, int size) {
+        Game::startLevel(new Stream(data, size));
     }
 }
 
@@ -95,14 +104,10 @@ void joyUpdate() {
 void main_loop() {
     joyUpdate();
 
-    int time = getTime();
-    if (time - lastTime <= 0)
-        return;
-    Game::update((time - lastTime) * 0.001f);
-    lastTime = time;
-    
-    Game::render();
-    eglSwapBuffers(display, surface);
+    if (Game::update()) {
+		Game::render();
+		eglSwapBuffers(display, surface);
+	}
 }
 
 bool initGL() {
@@ -139,8 +144,14 @@ void freeGL() {
 }
 
 EM_BOOL resize() {
-    int f;
-    emscripten_get_canvas_size(&Core::width, &Core::height, &f);
+    //int f;
+    //emscripten_get_canvas_size(&Core::width, &Core::height, &f);
+	double w, h;
+	emscripten_get_element_css_size(NULL, &w, &h);
+	Core::width  = int(w);
+	Core::height = int(h);
+	emscripten_set_canvas_size(Core::width, Core::height);
+	LOG("resize %d %d\n", Core::width, Core::height);
     return 1;
 }
 
@@ -172,7 +183,7 @@ void changeWindowMode() {
 
 InputKey keyToInputKey(int code) {
     static const int codes[] = {
-        0x25, 0x27, 0x26, 0x28, 0x20, 0x0D, 0x1B, 0x10, 0x11, 0x12,
+        0x25, 0x27, 0x26, 0x28, 0x20, 0x09, 0x0D, 0x1B, 0x10, 0x11, 0x12,
         '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
         'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M',
         'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
@@ -199,7 +210,8 @@ EM_BOOL keyCallback(int eventType, const EmscriptenKeyboardEvent *e, void *userD
 }
 
 EM_BOOL touchCallback(int eventType, const EmscriptenTouchEvent *e, void *userData) {
-    for (int i = 0; i < e->numTouches; i++) {      
+    for (int i = 0; i < e->numTouches; i++) {
+        if (!e->touches[i].isChanged) continue;
         InputKey key = Input::getTouch(e->touches[i].identifier);
         if (key == ikNone) continue;
         Input::setPos(key, vec2(e->touches[i].canvasX, e->touches[i].canvasY));
@@ -207,7 +219,6 @@ EM_BOOL touchCallback(int eventType, const EmscriptenTouchEvent *e, void *userDa
         if (eventType == EMSCRIPTEN_EVENT_TOUCHSTART || eventType == EMSCRIPTEN_EVENT_TOUCHEND || eventType == EMSCRIPTEN_EVENT_TOUCHCANCEL) 
             Input::setDown(key, eventType == EMSCRIPTEN_EVENT_TOUCHSTART);
     }
-
     return 1;
 }
 
@@ -227,6 +238,39 @@ EM_BOOL mouseCallback(int eventType, const EmscriptenMouseEvent *e, void *userDa
     return 1;
 }
 
+const char *IDB = "db";
+
+void onError(void *str) {
+    LOG("! IDB error: %s\n", str);
+}
+
+void onLoad(void *arg, void *data, int size) {
+    Stream *stream = (Stream*)arg;
+
+    FILE *f = fopen(stream->name, "wb");
+    fwrite(data, size, 1, f);
+    fclose(f);
+
+    stream->callback(new Stream(stream->name), stream->userData);	
+    delete stream;
+}
+
+void onLoadAndStore(void *arg, void *data, int size) {
+    emscripten_idb_async_store(IDB, ((Stream*)arg)->name, data, size, NULL, NULL, onError);
+    onLoad(arg, data, size);
+}
+
+void onExists(void *arg, int exists) {
+    if (exists)
+        emscripten_idb_async_load(IDB, ((Stream*)arg)->name, arg, onLoad, onError);
+    else
+        emscripten_async_wget_data(((Stream*)arg)->name, arg, onLoadAndStore, onError);
+}
+
+void osDownload(Stream *stream) {
+    emscripten_idb_async_exists(IDB, stream->name, stream, onExists, onError);
+}
+
 char Stream::cacheDir[255];
 char Stream::contentDir[255];
 
@@ -237,7 +281,7 @@ int main() {
 
     emscripten_set_keydown_callback(0, 0, 1, keyCallback);
     emscripten_set_keyup_callback(0, 0, 1, keyCallback);
-    emscripten_set_resize_callback(0, 0, 1, resizeCallback);
+    emscripten_set_resize_callback(0, 0, 0, resizeCallback);
 
     emscripten_set_touchstart_callback(0, 0, 0, touchCallback);
     emscripten_set_touchend_callback(0, 0, 0, touchCallback);
@@ -252,11 +296,9 @@ int main() {
     emscripten_run_script("snd_init()");
     resize();
 
-    lastTime = getTime();
-
     emscripten_set_main_loop(main_loop, 0, true);
 
-    Game::free();
+    Game::deinit();
     freeGL();
 
     return 0;

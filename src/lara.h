@@ -6,7 +6,7 @@
 #include "character.h"
 #include "trigger.h"
 #include "sprite.h"
-#include "inventory.h"
+#include "enemy.h"
 
 #define TURN_FAST           PI
 #define TURN_FAST_BACK      PI * 3.0f / 4.0f
@@ -20,6 +20,9 @@
 
 #define LARA_TILT_SPEED     (DEG2RAD * 37.5f)
 #define LARA_TILT_MAX       (DEG2RAD * 10.0f)
+
+#define LARA_MAX_HEALTH     1000.0f
+#define LARA_MAX_OXYGEN     60.0f
 
 #define LARA_HANG_OFFSET    724
 #define LARA_HEIGHT         762
@@ -35,9 +38,12 @@
 #define LARA_WET_SPECULAR   0.5f
 #define LARA_WET_TIMER      (LARA_WET_SPECULAR / 16.0f)   // 4 sec
 
+#define LARA_DAMAGE_TIME    (40.0f / 30.0f)
+
 #define PICKUP_FRAME_GROUND     40
-#define PICKUP_FRAME_UNDERWATER 16
+#define PICKUP_FRAME_UNDERWATER 18
 #define PUZZLE_FRAME            80
+#define KEY_FRAME               110
 
 #define MAX_TRIGGER_ACTIONS 64
 
@@ -53,14 +59,17 @@ struct Lara : Character {
         ANIM_STAND_LEFT         = 2,
         ANIM_STAND_RIGHT        = 3,
 
+        ANIM_RUN_START          = 6,
+
         ANIM_STAND              = 11,
 
         ANIM_CLIMB_JUMP         = 26,
 
-        ANIM_HANG_FALL          = 28,
+        ANIM_FALL_HANG          = 28,
 
-        ANIM_FALL               = 34,
         ANIM_SMASH_JUMP         = 32,
+
+        ANIM_FALL_FORTH         = 34,
 
         ANIM_CLIMB_3            = 42,
 
@@ -79,6 +88,8 @@ struct Lara : Character {
 
         ANIM_SLIDE_FORTH        = 70,
 
+        ANIM_FALL_BACK          = 93,
+
         ANIM_HANG               = 96,
 
         ANIM_STAND_NORMAL       = 103,
@@ -94,10 +105,18 @@ struct Lara : Character {
         ANIM_HIT_BACK           = 126,
         ANIM_HIT_LEFT           = 127,
         ANIM_HIT_RIGHT          = 128,
+
+        ANIM_DEATH_BOULDER      = 139,
+
         ANIM_STAND_ROLL_BEGIN   = 146,
         ANIM_STAND_ROLL_END     = 147,
 
+        ANIM_DEATH_SPIKES       = 149,
         ANIM_HANG_SWING         = 150,
+
+        ANIM_SWITCH_BIG_DOWN    = 195,
+        ANIM_SWITCH_BIG_UP      = 196,
+        ANIM_PUSH_BUTTON        = 197,
     };
 
     // http://www.tombraiderforums.com/showthread.php?t=211681
@@ -106,7 +125,7 @@ struct Lara : Character {
         STATE_RUN,
         STATE_STOP,
         STATE_FORWARD_JUMP,
-        STATE_4,
+        STATE_POSE,
         STATE_FAST_BACK,
         STATE_TURN_RIGHT,
         STATE_TURN_LEFT,
@@ -152,8 +171,8 @@ struct Lara : Character {
         STATE_SURF_BACK,
         STATE_SURF_LEFT,
         STATE_SURF_RIGHT,
-        STATE_NULL_50,
-        STATE_NULL_51,
+        STATE_MIDAS_USE,
+        STATE_MIDAS_DEATH,
         STATE_SWAN_DIVE,
         STATE_FAST_DIVE,
         STATE_HANDSTAND,
@@ -185,37 +204,49 @@ struct Lara : Character {
         BODY_BRAID_MASK = BODY_HEAD   | BODY_CHEST  | BODY_ARM_L1 | BODY_ARM_L2 | BODY_ARM_R1 | BODY_ARM_R2,
     };
 
-    bool home;
+    bool dozy;
 
     struct Weapon {
         enum Type  { EMPTY = -1, PISTOLS, SHOTGUN, MAGNUMS, UZIS, MAX };
         enum State { IS_HIDDEN, IS_ARMED, IS_FIRING };
         enum Anim  { NONE, PREPARE, UNHOLSTER, HOLSTER, HOLD, AIM, FIRE };
-
-        int ammo;   // if -1 weapon is not available
-    } weapons[Weapon::MAX];
+    };
 
     Weapon::Type    wpnCurrent;
     Weapon::Type    wpnNext;
     Weapon::State   wpnState;
+    int             *wpnAmmo;
     vec3            chestOffset;
 
     struct Arm {
-        int             target;
+        Controller      *tracking;       // tracking target (main target)
+        Controller      *target;         // target for shooting
         float           shotTimer;
         quat            rot, rotAbs;
         Weapon::Anim    anim;
         Animation       animation;
+
+        Arm() : tracking(NULL), target(NULL) {}
     } arms[2];
 
-    ActionCommand actionList[MAX_TRIGGER_ACTIONS];
+    TR::Entity::Type  usedKey;
+    int               pickupListCount;
+    Controller        *pickupList[32];
+    KeyHole           *keyHole;
+    Lightning         *lightning;
+    Texture           *environment;
+    vec2              rotFactor;
 
-    Inventory inventory;
-    int lastPickUp;
-    int viewTarget;
-    int roomPrev; // water out from room
-    vec2 rotFactor;
-
+    float       oxygen;
+    float       damageTime;
+    float       hitTime;
+    int         hitDir;
+    vec3        collisionOffset;
+    vec3        flowVelocity;
+#ifdef _DEBUG
+    //uint16      *dbgBoxes;
+    //int         dbgBoxesCount;
+#endif
     struct Braid {
         Lara *lara;
         vec3 offset;
@@ -268,7 +299,7 @@ struct Lara : Character {
 
         void integrate() {
             float TIMESTEP = Core::deltaTime;
-            float ACCEL    = 6.0f * GRAVITY * TIMESTEP * TIMESTEP;
+            float ACCEL    = 16.0f * GRAVITY * TIMESTEP * TIMESTEP;
             float DAMPING  = 1.5f;
 
             if (lara->getRoom().flags.water) {
@@ -296,7 +327,14 @@ struct Lara : Character {
 
         void collide() {
             TR::Level *level = lara->level;
-            TR::Model *model = lara->getModel();
+            const TR::Model *model = lara->getModel();
+
+            TR::Level::FloorInfo info;
+            lara->getFloorInfo(lara->getRoomIndex(), lara->getViewPoint(), info);
+
+            for (int j = 1; j < jointsCount; j++)
+                if (joints[j].pos.y > info.floor)
+                    joints[j].pos.y = info.floor;
 
             #define BRAID_RADIUS 16.0f
 
@@ -369,35 +407,44 @@ struct Lara : Character {
                 basis[i].rotate(m.getRot());
             }
         }
-
+        
         void render(MeshBuilder *mesh) {
-            Core::active.shader->setParam(uBasis, basis[0], jointsCount);
+            Core::active.shader->setParam(uBasis, basis[0], jointsCount - 1);
             mesh->renderModel(lara->level->extra.braid);
         }
 
     } *braid;
 
-    Lara(IGame *game, int entity, bool home) : Character(game, entity, 1000), home(home), wpnCurrent(Weapon::EMPTY), wpnNext(Weapon::EMPTY), chestOffset(pos), viewTarget(-1), braid(NULL) {
+    Lara(IGame *game, int entity) : Character(game, entity, LARA_MAX_HEALTH), dozy(false), wpnCurrent(Weapon::EMPTY), wpnNext(Weapon::EMPTY), chestOffset(pos), braid(NULL) {
+        if (level->extra.laraSkin > -1)
+            level->entities[entity].modelIndex = level->extra.laraSkin + 1;
 
-        if (getEntity().type == TR::Entity::LARA) {
-            if (getRoom().flags.water)
-                animation.setAnim(ANIM_UNDERWATER);
-            else
-                animation.setAnim(ANIM_STAND);
-        }
+        jointChest = 7;
+        jointHead  = 14;
+        rangeChest = vec4(-0.40f, 0.40f, -0.90f, 0.90f) * PI;
+        rangeHead  = vec4(-0.25f, 0.25f, -0.50f, 0.50f) * PI;
 
-        getEntity().flags.active = 1;
+        oxygen     = LARA_MAX_OXYGEN;
+        hitDir     = -1;
+        damageTime = LARA_DAMAGE_TIME;
+        hitTime    = 0.0f;
+
+        keyHole     = NULL;
+        lightning   = NULL;
+        environment = NULL;
+
+        flags.active = 1;
         initMeshOverrides();
 
-        memset(weapons, -1, sizeof(weapons));
-        if (!home) {
-            weapons[Weapon::PISTOLS].ammo = 0;
-            weapons[Weapon::SHOTGUN].ammo = 9000;
-            weapons[Weapon::MAGNUMS].ammo = 9000;
-            weapons[Weapon::UZIS   ].ammo = 9000;
-            wpnSet(Weapon::PISTOLS);
-        } else
-            meshSwap(1, TR::MODEL_LARA_SPEC, BODY_UPPER | BODY_LOWER);
+        if (level->isHome()) {
+            if (level->version & TR::VER_TR1)
+                meshSwap(1, TR::MODEL_LARA_SPEC, BODY_UPPER | BODY_LOWER);
+        } else {
+            if (level->id == TR::LVL_TR2_HOUSE)
+                wpnSet(Weapon::SHOTGUN);
+            else
+                wpnSet(Weapon::PISTOLS);
+        }
 
         for (int i = 0; i < 2; i++) {
             arms[i].shotTimer = MUZZLE_FLASH_TIME + 1.0f;
@@ -406,14 +453,18 @@ struct Lara : Character {
         }
 
         if (level->extra.braid > -1)
-            braid = new Braid(this, vec3(-4.0f, 24.0f, -48.0f));
-//reset(15, vec3(70067, -256, 29104), -0.68f);     // level 2 (pool)
+            braid = new Braid(this, (level->version & (TR::VER_TR2 | TR::VER_TR3)) ? vec3(-2.0f, -16.0f, -48.0f) : vec3(-4.0f, 24.0f, -48.0f));
     #ifdef _DEBUG
-        //reset(14, vec3(40448, 3584, 60928), PI * 0.5f, true);  // gym (pool)
-
+        //reset(14, vec3(40448, 3584, 60928), PI * 0.5f, STAND_ONWATER);  // gym (pool)
+        //reset(0, vec3(74858, 3072, 20795), 0);           // level 1 (dart)
         //reset(14, vec3(20215, 6656, 52942), PI);         // level 1 (bridge)
+        //reset(20, vec3(8952, 3840, 68071), PI);          // level 1 (crystal)
+        //reset(26, vec3(24475, 6912, 83505), 90 * DEG2RAD);     // level 1 (switch timer)
+        //reset(33, vec3(48229, 4608, 78420), 270 * DEG2RAD);     // level 1 (end)
+        //reset(9, vec3(63008, 0, 37787), 0);              // level 2 (switch)
         //reset(15, vec3(70067, -256, 29104), -0.68f);     // level 2 (pool)
-        //reset(61, vec3(27221, -1024, 29205), PI * 0.5f); // level 2 (blade)
+        //reset(26, vec3(71980, 1546, 19000), 270 * DEG2RAD);     // level 2 (underwater switch)
+        //reset(61, vec3(27221, -1024, 29205), -PI * 0.5f); // level 2 (blade)
         //reset(43, vec3(31400, -2560, 25200), PI);        // level 2 (reach)
         //reset(16, vec3(60907, 0, 39642), PI * 3 / 2);    // level 2 (hang & climb)
         //reset(19, vec3(60843, 1024, 30557), PI);         // level 2 (block)
@@ -425,31 +476,166 @@ struct Lara : Character {
         //reset(51, vec3(41015, 3584, 34494), -PI);        // level 3a (t-rex)
         //reset(5,  vec3(38643, -3072, 92370), PI * 0.5f); // level 3a (gears)
         //reset(43, vec3(64037, 6656, 48229), PI);         // level 3b (movingblock)
+        //reset(27, vec3(72372, 8704, 46547), PI * 0.5f);  // level 3b (spikes)
+        //reset(5, vec3(73394, 3840, 60758), 0);           // level 3b (scion)
+        //reset(20, vec3(57724, 6656, 61941), 90 * DEG2RAD); // level 3b (boulder)
+        //reset(18, vec3(34914, 11008, 41315), 90 * DEG2RAD); // level 4 (main hall)
+        //reset(19, vec3(33368, 19968, 45643), 270 * DEG2RAD); // level 4 (damocles)
+        //reset(24, vec3(45609, 18176, 41500), 90 * DEG2RAD); // level 4 (thor)
+        //reset(19, vec3(41418, -3707, 58863), 270 * DEG2RAD);  // level 5 (triangle)
+        //reset(21, vec3(24106, -4352, 52089), 0);              // level 6 (flame traps)
+        //reset(73, vec3(73372, 122, 51687), PI * 0.5f);       // level 6 (midas hand)
+        //reset(64, vec3(36839, -2560, 48769), 270 * DEG2RAD);  // level 6 (flipmap effect)
+        //reset(99,  vec3(45562, -3328, 63366), 225 * DEG2RAD); // level 7a (flipmap)
+        //reset(77,  vec3(36943, -4096, 62821), 270 * DEG2RAD); // level 7b (heavy trigger)
+        //reset(90,  vec3(19438, 3840, 78341), 90 * DEG2RAD); // level 7b (statues)
+        //reset(90,  vec3(29000, 3840 - 512, 78341), 90 * DEG2RAD); // level 7b (statues)
+        //reset(57,  vec3(54844, -3328, 53145), 0);        // level 8b (bridge switch)
+        //reset(12,  vec3(34236, -2415, 14974), 0);        // level 8b (sphinx)
         //reset(0,  vec3(40913, -1012, 42252), PI);        // level 8c
-        //reset(10, vec3(90443, 11264 - 256, 114614), PI, true);   // villa mortal 2
+        //reset(56,  vec3(18541, 512, 52869), PI * 0.5f);        // level 8c
+        //reset(30, vec3(69689, -8448, 34922), 330 * DEG2RAD);      // Level 10a (cabin)
+        //reset(27, vec3(52631, -4352, 57893), 270 * DEG2RAD);      // Level 10a (TNT / Cowboy)
+        //reset(68, vec3(52458, -9984, 93724), 270 * DEG2RAD);      // Level 10a (MrT)
+        //reset(44, vec3(75803, -11008, 21097), 90 * DEG2RAD);      // Level 10a (boat)
+        //reset(47, vec3(50546, -13056, 53783), 270 * DEG2RAD);      // Level 10b (trap door slope)
+        //reset(59, vec3(42907, -13056, 63012), 270 * DEG2RAD);      // Level 10b (doppelganger)
+        //reset(50, vec3(52122, -18688, 47313), 150 * DEG2RAD);      // Level 10b (scion holder pickup)
+        //reset(50, vec3(53703, -18688, 13769), PI);                // Level 10c (scion holder)
+        //reset(19, vec3(35364, -512, 40199), PI * 0.5f);           // Level 10c (lava flow)
+        //reset(9, vec3(69074, -14592, 25192), 0);                  // Level 10c (trap slam)
+        //reset(21, vec3(47668, -10752, 32163), 0);                 // Level 10c (lava emitter)
+        //reset(10, vec3(90443, 11264 - 256, 114614), PI, STAND_ONWATER);   // villa mortal 2
+        //dbgBoxes = NULL;
     #endif
-        chestOffset = animation.getJoints(getMatrix(), 7).pos;
+
+        if (!level->isCutsceneLevel()) {
+            if (getRoom().flags.water) {
+                stand = STAND_UNDERWATER;
+                animation.setAnim(ANIM_UNDERWATER);
+            } else
+                animation.setAnim(ANIM_STAND);
+        }
+
+        chestOffset = animation.getJoints(getMatrix(), jointChest).pos;
     }
 
     virtual ~Lara() {
         delete braid;
+        delete environment;
     }
 
-    void reset(int room, const vec3 &pos, float angle, bool onwater = false) {
-        getEntity().room = room;
-        this->pos        = pos;
-        this->angle      = vec3(0.0f, angle, 0.0f);
-        if (onwater) {
-            stand = STAND_ONWATER;
-            animation.setAnim(ANIM_TO_ONWATER);
+    bool canSaveGame() {
+        return health > 0.0f && (state == STATE_STOP || state == STATE_TREAD || state == STATE_SURF_TREAD);
+    }
+
+    virtual bool getSaveData(TR::SaveGame::Entity &data) {
+        Character::getSaveData(data);
+        data.extraSize = sizeof(data.extra.lara);
+        data.extra.lara.velX        = velocity.x;
+        data.extra.lara.velY        = velocity.y;
+        data.extra.lara.velZ        = velocity.z;
+        data.extra.lara.angleX      = angle.x;
+        data.extra.lara.health      = health;
+        data.extra.lara.oxygen      = oxygen;
+        data.extra.lara.stamina     = 0.0f;
+        data.extra.lara.poison      = 0.0f;
+        data.extra.lara.freeze      = 0.0f;
+        data.extra.lara.itemHands   = TR::Entity::LARA;
+        data.extra.lara.itemBack    = TR::Entity::SHOTGUN;
+        data.extra.lara.itemHolster = TR::Entity::PISTOLS;
+        data.extra.lara.flags.value = 0;
+        data.extra.lara.flags.burn  = 0; // TODO
+        data.extra.lara.flags.wet   = 0; // TODO
+        return true;
+    }
+
+    virtual void setSaveData(const TR::SaveGame::Entity &data) {
+        Character::setSaveData(data);
+        velocity = vec3(data.extra.lara.velX, data.extra.lara.velY, data.extra.lara.velZ);
+        angle.x  = TR::angle(data.extra.lara.angleX);
+        health   = data.extra.lara.health;
+        oxygen   = data.extra.lara.oxygen;
+
+        layers[1].mask = layers[2].mask = layers[3].mask = 0;
+        wpnState   = Weapon::IS_HIDDEN;
+        wpnCurrent = Weapon::EMPTY;
+/*
+        wpnSet(Weapon::Type(data.extra.lara.curWeapon));
+        if (!data.extra.lara.emptyHands)
+            wpnDraw(true);
+*/
+    }
+
+    int getRoomByPos(const vec3 &pos) {
+        int x = int(pos.x),
+            y = int(pos.y),
+            z = int(pos.z);
+
+        for (int i = 0; i < level->roomsCount; i++) {
+            TR::Room &r = level->rooms[i];
+            int mx = r.info.x + r.xSectors * 1024;
+            int mz = r.info.z + r.zSectors * 1024;
+            if (x >= r.info.x && x < mx && z >= r.info.z && z < mz && y >= r.info.yTop && y < r.info.yBottom)
+                return i;
         }
-        updateEntity();
+        return TR::NO_ROOM;
+    }
+
+    void reset(int room, const vec3 &pos, float angle, Stand forceStand = STAND_GROUND) {
+        visibleMask = 0xFFFFFFFF;
+
+        if (room == TR::NO_ROOM) {
+            stand = STAND_AIR;
+            room  = getRoomByPos(pos);
+        }
+
+        if (room == TR::NO_ROOM)
+            return;
+
+        if (level->rooms[room].flags.water) {
+            stand = STAND_UNDERWATER;
+            animation.setAnim(ANIM_UNDERWATER);
+        } else {
+            stand = STAND_GROUND;
+            animation.setAnim(ANIM_STAND);
+        }
+
+        velocity = vec3(0.0f);
+
+        roomIndex   = room;
+        this->pos   = pos;
+        this->angle = vec3(0.0f, angle, 0.0f);
+
+        if (forceStand != STAND_GROUND) {
+            stand = forceStand;
+            switch (stand) {
+                case STAND_ONWATER    : animation.setAnim(ANIM_TO_ONWATER); break;
+                case STAND_UNDERWATER : animation.setAnim(ANIM_UNDERWATER); break;
+                default               : ;
+            }
+        }
+
         updateLights(false);
+    }
+
+    TR::Entity::Type getCurrentWeaponInv() {
+        switch (wpnCurrent) {
+            case Weapon::Type::PISTOLS : return TR::Entity::PISTOLS;
+            case Weapon::Type::SHOTGUN : return TR::Entity::SHOTGUN;
+            case Weapon::Type::MAGNUMS : return TR::Entity::MAGNUMS;
+            case Weapon::Type::UZIS    : return TR::Entity::UZIS;
+            default                    : return TR::Entity::LARA;
+        }
     }
 
     void wpnSet(Weapon::Type wType) {
         wpnCurrent = wType;
         wpnState   = Weapon::IS_FIRING;
+
+        TR::Entity::Type invType = getCurrentWeaponInv();
+
+        wpnAmmo = game->invCount(invType);
 
         arms[0].animation = arms[1].animation = Animation(level, &level->models[wType == Weapon::SHOTGUN ? TR::MODEL_SHOTGUN : TR::MODEL_PISTOLS]);
 
@@ -476,7 +662,7 @@ struct Lara : Character {
         wpnSetState(wState);
     }
 
-    int wpnGetDamage() {
+    float wpnGetDamage() {
         switch (wpnCurrent) {
             case Weapon::PISTOLS : return 1;
             case Weapon::SHOTGUN : return 1;
@@ -512,8 +698,8 @@ struct Lara : Character {
             default : ;
         }
 
-        if (wpnState == Weapon::IS_HIDDEN && wState == Weapon::IS_ARMED)  playSound(TR::SND_UNHOLSTER, pos, Sound::Flags::PAN);
-        if (wpnState == Weapon::IS_ARMED  && wState == Weapon::IS_HIDDEN) playSound(TR::SND_HOLSTER,   pos, Sound::Flags::PAN);
+        if (wpnState == Weapon::IS_HIDDEN && wState == Weapon::IS_ARMED)  game->playSound(TR::SND_UNHOLSTER, pos, Sound::Flags::PAN);
+        if (wpnState == Weapon::IS_ARMED  && wState == Weapon::IS_HIDDEN) game->playSound(TR::SND_HOLSTER,   pos, Sound::Flags::PAN);
 
     // swap layers
     // 0 - body (full)
@@ -525,7 +711,7 @@ struct Lara : Character {
         if (wpnCurrent != Weapon::SHOTGUN) {
             meshSwap(1, level->extra.weapons[wpnCurrent], mask);
             // have a shotgun in inventory place it on the back if another weapon is in use
-            meshSwap(2, level->extra.weapons[Weapon::SHOTGUN], (weapons[Weapon::SHOTGUN].ammo != -1) ? BODY_CHEST : 0);
+            meshSwap(2, level->extra.weapons[Weapon::SHOTGUN], game->invCount(TR::Entity::INV_SHOTGUN) ? BODY_CHEST : 0);
         } else {
             meshSwap(2, level->extra.weapons[wpnCurrent], mask);
         }
@@ -550,6 +736,8 @@ struct Lara : Character {
     }
 
     bool canDrawWeapon() {
+        if (dozy) return true;
+
         return wpnCurrent != Weapon::EMPTY
                && emptyHands()
                && animation.index != ANIM_CLIMB_3
@@ -586,19 +774,32 @@ struct Lara : Character {
                && state != STATE_WATER_OUT;
     }
 
+    bool canHitAnim() {
+        return    state == STATE_WALK
+               || state == STATE_RUN
+               || state == STATE_STOP
+               || state == STATE_FAST_BACK
+               || state == STATE_TURN_RIGHT
+               || state == STATE_TURN_LEFT
+               || state == STATE_BACK
+               || state == STATE_FAST_TURN
+               || state == STATE_STEP_RIGHT
+               || state == STATE_STEP_LEFT;
+    }
+
     bool wpnReady() {
         return arms[0].anim != Weapon::Anim::PREPARE && arms[0].anim != Weapon::Anim::UNHOLSTER && arms[0].anim != Weapon::Anim::HOLSTER;
     }
 
-    void wpnDraw() {
+    void wpnDraw(bool instant = false) {
         if (!canDrawWeapon()) return;
 
         if (wpnReady() && emptyHands()) {
             if (wpnCurrent != Weapon::SHOTGUN) {
-                wpnSetAnim(arms[0], wpnState, Weapon::Anim::PREPARE, 0.0f, 1.0f);
-                wpnSetAnim(arms[1], wpnState, Weapon::Anim::PREPARE, 0.0f, 1.0f);
+                wpnSetAnim(arms[0], wpnState, instant ? Weapon::Anim::AIM : Weapon::Anim::PREPARE, 0.0f, 1.0f);
+                wpnSetAnim(arms[1], wpnState, instant ? Weapon::Anim::AIM : Weapon::Anim::PREPARE, 0.0f, 1.0f);
             } else
-                wpnSetAnim(arms[0], wpnState, Weapon::Anim::UNHOLSTER, 0.0f, 1.0f);
+                wpnSetAnim(arms[0], wpnState, instant ? Weapon::Anim::AIM : Weapon::Anim::UNHOLSTER, 0.0f, 1.0f);
         }
     }
 
@@ -613,7 +814,11 @@ struct Lara : Character {
     }
 
     void wpnChange(Weapon::Type wType) {
-        if (wpnCurrent == wType || home) return;
+        if (wpnCurrent == wType || level->isHome()) {
+            if (emptyHands())
+                wpnDraw();
+            return;
+        }
         wpnNext = wType;
         wpnHide();
     }
@@ -655,25 +860,25 @@ struct Lara : Character {
     void wpnFire() {
         bool armShot[2] = { false, false };
         for (int i = 0; i < 2; i++) {
-            if (arms[i].anim == Weapon::Anim::FIRE) {
-                Animation &anim = arms[i].animation;
+            Arm &arm = arms[i];
+            if (arm.anim == Weapon::Anim::FIRE) {
+                Animation &anim = arm.animation;
                 //int realFrameIndex = int(arms[i].animation.time * 30.0f / anim->frameRate) % ((anim->frameEnd - anim->frameStart) / anim->frameRate + 1);
                 if (anim.frameIndex != anim.framePrev) {
                     if (anim.frameIndex == 0) { //realFrameIndex < arms[i].animation.framePrev) {
-                        if ((input & ACTION) && (target == -1 || (target > -1 && arms[i].target > -1))) {
+                        if ((input & ACTION) && (!arm.tracking || arm.target))
                             armShot[i] = true;
-                        } else
-                            wpnSetAnim(arms[i], Weapon::IS_ARMED, Weapon::Anim::AIM, 0.0f, -1.0f, target == -1);
+                        else
+                            wpnSetAnim(arm, Weapon::IS_ARMED, Weapon::Anim::AIM, 0.0f, -1.0f, arm.target == NULL);
                     }
                 // shotgun reload sound
                     if (wpnCurrent == Weapon::SHOTGUN) {
                         if (anim.frameIndex == 10)
-                            playSound(TR::SND_SHOTGUN_RELOAD, pos, Sound::Flags::PAN);
+                            game->playSound(TR::SND_SHOTGUN_RELOAD, pos, Sound::Flags::PAN);
                     }
                 }
-
             }
-            arms[i].animation.framePrev = arms[i].animation.frameIndex;
+            arm.animation.framePrev = arm.animation.frameIndex;
 
             if (wpnCurrent == Weapon::SHOTGUN) break;
         }
@@ -684,10 +889,9 @@ struct Lara : Character {
 
     void doShot(bool rightHand, bool leftHand) {
         int count = wpnCurrent == Weapon::SHOTGUN ? 6 : 2;
-
         float nearDist = 32.0f * 1024.0f;
         vec3  nearPos;
-        bool  hasShot = false;
+        int   shots = 0;
 
         for (int i = 0; i < count; i++) {
             int armIndex;
@@ -700,8 +904,15 @@ struct Lara : Character {
             }
             Arm *arm = &arms[armIndex];
 
+            if (wpnAmmo && *wpnAmmo != UNLIMITED_AMMO) {
+                if (*wpnAmmo <= 0)
+                    continue;
+                if (wpnCurrent != Weapon::SHOTGUN)
+                    *wpnAmmo -= 1;
+            }
+
             arm->shotTimer = 0.0f;
-            hasShot = true;
+            shots++;
 
             int joint = wpnCurrent == Weapon::SHOTGUN ? 8 : (i ? 11 : 8);
 
@@ -711,13 +922,15 @@ struct Lara : Character {
 
             int room;
             vec3 hit = trace(getRoomIndex(), p, t, room, false);
-            if (target > -1 && checkHit(target, p, hit, hit)) {
-                ((Character*)level->entities[target].controller)->hit(wpnGetDamage());
+            if (arm->target && checkHit(arm->target, p, hit, hit)) {
+                TR::Entity::Type type = arm->target->getEntity().type;
+                ((Character*)arm->target)->hit(wpnGetDamage(), this);
                 hit -= d * 64.0f;
-                Sprite::add(game, TR::Entity::BLOOD, room, (int)hit.x, (int)hit.y, (int)hit.z, Sprite::FRAME_ANIMATED);
+                if (type != TR::Entity::SCION_TARGET)
+                    game->addEntity(TR::Entity::BLOOD, room, hit);
             } else {
                 hit -= d * 64.0f;
-                Sprite::add(game, TR::Entity::SPARK, room, (int)hit.x, (int)hit.y, (int)hit.z, Sprite::FRAME_RANDOM);
+                game->addEntity(TR::Entity::RICOCHET, room, hit);
 
                 float dist = (hit - p).length();
                 if (dist < nearDist) {
@@ -730,29 +943,21 @@ struct Lara : Character {
             Core::lightColor[1 + armIndex] = FLASH_LIGHT_COLOR;
         }
 
-        if (hasShot) {
-            playSound(wpnGetSound(), pos, Sound::Flags::PAN);
-            playSound(TR::SND_RICOCHET, nearPos, Sound::Flags::PAN);
+        if (shots) {
+            game->playSound(wpnGetSound(), pos, Sound::Flags::PAN);
+            game->playSound(TR::SND_RICOCHET, nearPos, Sound::Flags::PAN);
+
+             if (wpnAmmo && *wpnAmmo != UNLIMITED_AMMO && wpnCurrent == Weapon::SHOTGUN)
+                *wpnAmmo -= 1;
+        }
+
+        if (wpnAmmo && *wpnAmmo != UNLIMITED_AMMO && *wpnAmmo <= 0) {
+            wpnChange(Weapon::PISTOLS);
         }
     }
 
     void updateWeapon() {
-        if (level->cutEntity > -1) return;
-
-        if (input & DEATH) {
-            arms[0].shotTimer = arms[1].shotTimer = MUZZLE_FLASH_TIME + 1.0f;
-            animation.overrideMask = 0;
-            target = -1;
-            return;
-        }
-
-        updateTargets();
-        updateOverrides();
-
-        if (Input::down[ik1]) wpnChange(Weapon::PISTOLS);
-        if (Input::down[ik2]) wpnChange(Weapon::SHOTGUN);
-        if (Input::down[ik3]) wpnChange(Weapon::MAGNUMS);
-        if (Input::down[ik4]) wpnChange(Weapon::UZIS);
+        if (level->isCutsceneLevel()) return;
 
         if (wpnNext != Weapon::EMPTY && emptyHands()) {
             wpnSet(wpnNext);
@@ -772,23 +977,20 @@ struct Lara : Character {
             bool isRifle = wpnCurrent == Weapon::SHOTGUN;
 
             for (int i = 0; i < 2; i++) {
-                if (arms[i].target > -1 || ((input & ACTION) && target == -1)) {
-                    if (arms[i].anim == Weapon::Anim::HOLD)
-                        wpnSetAnim(arms[i], wpnState, Weapon::Anim::AIM, 0.0f, 1.0f);
+                Arm &arm = arms[i];
+
+                if (arm.target || ((input & ACTION) && !arm.tracking)) {
+                    if (arm.anim == Weapon::Anim::HOLD)
+                        wpnSetAnim(arm, wpnState, Weapon::Anim::AIM, 0.0f, 1.0f);
                 } else
-                    if (arms[i].anim == Weapon::Anim::AIM)
-                        arms[i].animation.dir = -1.0f;
+                    if (arm.anim == Weapon::Anim::AIM)
+                        arm.animation.dir = -1.0f;
 
                 if (isRifle) break;
             }
 
-            for (int i = 0; i < 2; i++) {
+            for (int i = 0; i < 2; i++)
                 arms[i].animation.update();
-                arms[i].shotTimer += Core::deltaTime;
-
-                float intensity = clamp((0.1f - arms[i].shotTimer) * 20.0f, EPS, 1.0f);
-                Core::lightColor[1 + i] = FLASH_LIGHT_COLOR * vec4(intensity, intensity, intensity, 1.0f / sqrtf(intensity));
-            }
 
             if (isRifle)
                 animateShotgun();
@@ -860,11 +1062,12 @@ struct Lara : Character {
     }
 
     void updateOverrides() {
+        int overrideMask = 0;
         // head & chest
-        animation.overrideMask |= BODY_CHEST | BODY_HEAD;
+        overrideMask |= BODY_CHEST | BODY_HEAD;
 
-        animation.overrides[ 7] = animation.getJointRot( 7);
-        animation.overrides[14] = animation.getJointRot(14);
+        animation.overrides[jointChest] = animation.getJointRot(jointChest);
+        animation.overrides[jointHead]  = animation.getJointRot(jointHead);
 
     /* TODO: shotgun full body animation
         if (wpnCurrent == Weapon::SHOTGUN) {
@@ -874,6 +1077,7 @@ struct Lara : Character {
         }
     */
 
+    // arms
         if (!emptyHands()) {
             // right arm
             Arm *arm = &arms[0];
@@ -886,57 +1090,86 @@ struct Lara : Character {
             animation.overrides[12] = arm->animation.getJointRot(12);
             animation.overrides[13] = arm->animation.getJointRot(13);
 
-            animation.overrideMask |=  (BODY_ARM_R | BODY_ARM_L);
+            overrideMask |=  (BODY_ARM_R | BODY_ARM_L);
         } else
-            animation.overrideMask &= ~(BODY_ARM_R | BODY_ARM_L);
+            overrideMask &= ~(BODY_ARM_R | BODY_ARM_L);
 
+    // update hit anim
+        if (hitDir >= 0) {
+            Animation hitAnim = Animation(level, getModel());
+            switch (hitDir) {
+                case 0 : hitAnim.setAnim(ANIM_HIT_FRONT, 0, false); break;
+                case 1 : hitAnim.setAnim(ANIM_HIT_LEFT,  0, false); break;
+                case 2 : hitAnim.setAnim(ANIM_HIT_BACK , 0, false); break;
+                case 3 : hitAnim.setAnim(ANIM_HIT_RIGHT, 0, false); break;
+            }
+            hitTime = min(hitTime, hitAnim.timeMax - EPS);
+            hitAnim.time = hitTime;
+            hitAnim.updateInfo();
+            
+            overrideMask &= ~(BODY_CHEST | BODY_HEAD);
+            int hitMask = (BODY_UPPER | BODY_LOWER | BODY_HEAD) & ~overrideMask;
+            int index    = 0;
+            while (hitMask) {
+                if (hitMask & 1)
+                    animation.overrides[index] = hitAnim.getJointRot(index);
+                index++;
+                hitMask >>= 1;
+            }
 
-        lookAt(viewTarget);
+            hitTime += Core::deltaTime;
+            overrideMask = BODY_UPPER | BODY_LOWER | BODY_HEAD;
+        }
 
-        if (wpnCurrent == Weapon::SHOTGUN)
-            aimShotgun();
-        else
-            aimPistols();
+        animation.overrideMask = overrideMask;
     }
 
-    void lookAt(int target) { // TODO: character lookAt
-        float speed = 8.0f * Core::deltaTime;
-        quat rot;
+    virtual void lookAt(Controller *target) {
+        if (health <= 0.0f)
+            return;
 
-        bool can = canLookAt();
-        // chest
-        if (can && aim(target, 7, vec4(-PI * 0.4f, PI * 0.4f, -PI * 0.9f, PI * 0.9f), rot))
-            rotChest = rotChest.slerp(quat(0, 0, 0, 1).slerp(rot, 0.5f), speed);
-        else
-            rotChest = rotChest.slerp(quat(0, 0, 0, 1), speed);
-        animation.overrides[7] = rotChest * animation.overrides[7];
+        updateOverrides();
 
-        // head
-        if (can && aim(target, 14, vec4(-PI * 0.25f, PI * 0.25f, -PI * 0.5f, PI * 0.5f), rot))
-            rotHead = rotHead.slerp(rot, speed);
-        else
-            rotHead = rotHead.slerp(quat(0, 0, 0, 1), speed);
-        animation.overrides[14] = rotHead * animation.overrides[14];
+        Character::lookAt(canLookAt() ? target : NULL);
+
+        if (!emptyHands()) {
+            updateTargets();
+
+            if (wpnCurrent == Weapon::SHOTGUN)
+                aimShotgun();
+            else
+                aimPistols();
+        }
     }
 
     void aimShotgun() {
         quat rot;
-        if (!aim(target, 14, vec4(-PI * 0.4f, PI * 0.4f, -PI * 0.25f, PI * 0.25f), rot, &arms[0].rotAbs))
-            arms[0].target = -1;
+
+        Arm &arm = arms[0];
+        arm.target = aim(arm.target, 14, vec4(-PI * 0.4f, PI * 0.4f, -PI * 0.25f, PI * 0.25f), rot, &arm.rotAbs) ? arm.target : NULL;
     }
 
     void aimPistols() {
         float speed = 8.0f * Core::deltaTime;
 
-        for (int i = 0; i < 2; i++) {
-            int joint  = i ? 11 : 8;
-            vec4 range = i ? vec4(-PI * 0.4f, PI * 0.4f, -PI * 0.5f, PI * 0.2f) : vec4(-PI * 0.4f, PI * 0.4f, -PI * 0.2f, PI * 0.5f);
+        int joints[2] = { 8, 11 };
 
-            Arm &arm = arms[i];
+        vec4 ranges[2] = {
+            vec4(-PI * 0.4f, PI * 0.4f, -PI * 0.2f, PI * 0.5f),
+            vec4(-PI * 0.4f, PI * 0.4f, -PI * 0.5f, PI * 0.2f),
+        };
+        
+        for (int i = 0; i < 2; i++) {
             quat rot;
-            if (!aim(target, joint, range, rot, &arm.rotAbs)) {
-                arm.target = -1;
-                rot = quat(0, 0, 0, 1);
+            Arm &arm = arms[i];
+            int j = joints[i];
+
+            if (!aim(arm.target, j, ranges[i], rot, &arm.rotAbs)) {                
+                arm.target = arms[i^1].target;
+                if (!aim(arm.target, j, ranges[i], rot, &arm.rotAbs)) {
+                    rot = quat(0, 0, 0, 1);
+                    arm.target = NULL;
+                }
             }
 
             float t;
@@ -948,51 +1181,137 @@ struct Lara : Character {
                 t = 0.0f;
 
             arm.rot = arm.rot.slerp(rot, speed);
-            animation.overrides[joint] = animation.overrides[joint].slerp(arm.rot * animation.overrides[joint], t);
+            animation.overrides[j] = animation.overrides[j].slerp(arm.rot * animation.overrides[j], t);
         }
     }
 
     void updateTargets() {
+        arms[0].target = arms[1].target = NULL;
+        viewTarget = NULL;
+
         if (emptyHands() || !wpnReady()) {
-            target = arms[0].target = arms[1].target = -1;
+            arms[0].tracking = arms[1].tracking = NULL;
             return;
         }
 
-        if (!(input & ACTION)) {
-            target = getTarget();
-            arms[0].target = arms[1].target = target;
-        } else
-            if (target > -1) {
-                TR::Entity &e = level->entities[target];
-                vec3 to   = ((Controller*)e.controller)->pos;
-                vec3 from = pos - vec3(0, 512, 0);
-                arms[0].target = arms[1].target = checkOcclusion(from, to, (to - from).length()) ? target : -1;
-            }
-    }
-
-    int getTarget() {
-        vec3 dir = getDir().normal();
-        float dist = TARGET_MAX_DIST;// * TARGET_MAX_DIST;
-
-        int index = -1;
-        for (int i = 0; i < level->entitiesCount; i++) {
-            TR::Entity &e = level->entities[i];
-            if (!e.flags.active || !e.isEnemy()) continue;
-            Character *controller = (Character*)e.controller;
-            if (controller->health <= 0) continue;
-
-            vec3 p = controller->pos;
-            vec3 v = p - pos;
-            if (dir.dot(v.normal()) <= 0.5f) continue; // target is out of sight -60..+60 degrees
-
-            float d = v.length();
-            if (d < dist && checkOcclusion(pos - vec3(0, 512, 0), p, d) ) {
-                index = i;
-                dist  = d;
-            }
+        // auto retarget 
+        bool retarget = false;
+        if (Core::settings.controls.retarget) {
+            for (int i = 0; i < 2; i++)
+                if (!arms[i].tracking || ((Character*)arms[i].tracking)->health <= 0.0f) {
+                    retarget = true;
+                    break;
+                }
         }
 
-        return index;
+        int count = wpnCurrent != Weapon::SHOTGUN ? 2 : 1;
+        if (!(input & ACTION) || retarget) {
+            getTargets(arms[0].tracking, arms[1].tracking);
+            if (count == 1)
+                arms[1].tracking = NULL;
+            else if (!arms[0].tracking && arms[1].tracking)
+                arms[0].tracking = arms[1].tracking;
+            else if (!arms[1].tracking && arms[0].tracking)
+                arms[1].tracking = arms[0].tracking;
+            arms[0].target = arms[0].tracking;
+            arms[1].target = arms[1].tracking;
+        } else {
+            if (!arms[0].tracking && !arms[1].tracking)
+                return;
+
+        // flip left and right by relative target direction
+            if (count > 1) {
+                int side[2] = { 0, 0 };
+                vec3 dir = getDir();
+                dir.y = 0.0f;
+
+                for (int i = 0; i < count; i++)
+                    if (arms[i].tracking) {
+                        vec3 v = arms[i].tracking->pos - pos;
+                        v.y = 0;
+                        side[i] = sign(v.cross(dir).y);
+                    }
+
+                if (side[0] > 0 && side[1] < 0)
+                    swap(arms[0].tracking, arms[1].tracking);
+            }
+
+        // check occlusion for tracking targets
+            for (int i = 0; i < count; i++)
+                if (arms[i].tracking) {
+                    Controller *enemy = (Controller*)arms[i].tracking;
+
+                    Box box = enemy->getBoundingBox();
+                    vec3 to = box.center();
+                    to.y = box.min.y + (box.max.y - box.min.y) / 3.0f;
+
+                    vec3 from = pos - vec3(0, 650, 0);
+                    arms[i].target = checkOcclusion(from, to, (to - from).length()) ? arms[i].tracking : NULL;
+                }
+
+            if (count == 1)
+                arms[1].target = NULL;
+            else if (!arms[0].target && arms[1].target)
+                arms[0].target = arms[1].target;
+            else if (!arms[1].target && arms[0].target)
+                arms[1].target = arms[0].target;
+        }
+
+        if (arms[0].target && arms[1].target && arms[0].target != arms[1].target) {
+            viewTarget = NULL; //arms[0].target;
+        } else if (arms[0].target)
+            viewTarget = arms[0].target;
+        else if (arms[1].target)
+            viewTarget = arms[1].target;
+        else if (arms[0].tracking)
+            viewTarget = arms[0].tracking;
+        else if (arms[1].tracking)
+            viewTarget = arms[1].tracking;
+    }
+
+    void getTargets(Controller *&target1, Controller *&target2) {
+        vec3 dir = getDir().normal();
+        float dist[2]  = { TARGET_MAX_DIST, TARGET_MAX_DIST };
+
+        target1 = target2 = NULL;
+
+        vec3 from = pos - vec3(0, 650, 0);
+
+        Controller *c = Controller::first;
+        do {
+            if (!c->getEntity().isEnemy())
+                continue;
+
+            Character *enemy = (Character*)c;
+            if (enemy->health <= 0)
+                continue;
+
+            Box box = enemy->getBoundingBox();
+            vec3 p = box.center();
+            p.y = box.min.y + (box.max.y - box.min.y) / 3.0f;
+            
+            vec3 v = p - pos;
+            if (dir.dot(v.normal()) <= 0.5f)
+                continue; // target is out of view range -60..+60 degrees
+
+            float d = v.length();
+
+            if ((d > dist[0] && d > dist[1]) || !checkOcclusion(from, p, d)) 
+                continue;
+
+            if (d < dist[0]) {
+                target2 = target1;
+                dist[1] = dist[0];
+                target1 = enemy;
+                dist[0] = d;
+            } else if (d < dist[1]) {
+                target2 = enemy;
+                dist[1] = d;
+            }
+        } while ((c = c->next));
+
+        if (!target2 || dist[1] > dist[0] * 4)
+            target2 = target1;
     }
 
     bool checkOcclusion(const vec3 &from, const vec3 &to, float dist) {
@@ -1001,17 +1320,28 @@ struct Lara : Character {
         return ((d - from).length() > (dist - 512.0f));
     }
 
-    bool checkHit(int target, const vec3 &from, const vec3 &to, vec3 &point) {
-        TR::Entity &e = level->entities[target];
-        Box box = ((Controller*)e.controller)->getBoundingBox();
+    bool checkHit(Controller *target, const vec3 &from, const vec3 &to, vec3 &point) {
+        Box box = target->getBoundingBoxLocal();
+        mat4 m  = target->getMatrix();
+
         float t;
-        vec3 v = (to - from);
-        vec3 dir = v.normal();
-        if (box.intersect(from, dir, t) && v.length() > t) {
-            point = from + dir * t;
-            return true;
-        } else
-            return false;
+        vec3 v = to - from;
+        
+        if (box.intersect(m, from, v, t)) {
+            t *= v.length();
+            v = v.normal();
+            Sphere spheres[MAX_SPHERES];
+            int count;
+            target->getSpheres(spheres, count);
+            for (int i = 0; i < count; i++) {
+                float st;
+                if (spheres[i].intersect(from, v, st)) {
+                    point = from + v * max(t, st);
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     virtual void cmdEmpty() {
@@ -1026,33 +1356,237 @@ struct Lara : Character {
     virtual void cmdJump(const vec3 &vel) {
         vec3 v = vel;
         if (state == STATE_HANG_UP)
-            v.y = (3.0f - sqrtf(-2.0f * GRAVITY / 30.0f * (collision.info[Collision::FRONT].floor - pos.y + 800.0f)));
+            v.y = (3.0f - sqrtf(-2.0f * GRAVITY / 30.0f * (collision.info[Collision::FRONT].floor - pos.y + 800.0f - 128.0f)));
         Character::cmdJump(v);
     }
 
     void drawGun(int right) {
-        int mask = right ? BODY_ARM_R3 : BODY_ARM_L3; // unholster
+        int mask = (right ? BODY_ARM_R3 : BODY_ARM_L3); // unholster
         if (layers[1].mask & mask)
-            mask = right ? BODY_LEG_R1 : BODY_LEG_L1; // holster
+            mask = (layers[1].mask & ~mask) | (right ? BODY_LEG_R1 : BODY_LEG_L1); // holster
+        else
+            mask |= layers[1].mask;
         meshSwap(1, level->extra.weapons[wpnCurrent], mask);
     }
 
-    virtual void cmdEffect(int fx) {
+    void doBubbles() {
+        int count = rand() % 3;
+        if (!count) return;
+        game->playSound(TR::SND_BUBBLE, pos, Sound::Flags::PAN);
+        vec3 head = animation.getJoints(getMatrix(), 14, true) * vec3(0.0f, 0.0f, 50.0f);
+        for (int i = 0; i < count; i++)
+            game->addEntity(TR::Entity::BUBBLE, getRoomIndex(), head, 0);
+    }
 
+    virtual void cmdEffect(int fx) {
         switch (fx) {
-            case TR::EFFECT_FLIP_MAP       : break; // TODO
-            case TR::EFFECT_LARA_HANDSFREE : break;//meshSwap(1, level->extra.weapons[wpnCurrent], BODY_LEG_L1 | BODY_LEG_R1); break;
-            case TR::EFFECT_DRAW_RIGHTGUN  :
-            case TR::EFFECT_DRAW_LEFTGUN   : drawGun(fx == TR::EFFECT_DRAW_RIGHTGUN); break;
-            default : LOG("unknown effect command %d (anim %d)\n", fx, animation.index);
+            case TR::Effect::LARA_NORMAL    : animation.setAnim(ANIM_STAND); break;
+            case TR::Effect::LARA_BUBBLES   : doBubbles(); break;
+            case TR::Effect::LARA_HANDSFREE : break;//meshSwap(1, level->extra.weapons[wpnCurrent], BODY_LEG_L1 | BODY_LEG_R1); break;
+            case TR::Effect::DRAW_RIGHTGUN  : drawGun(true); break;
+            case TR::Effect::DRAW_LEFTGUN   : drawGun(false); break;
+            case TR::Effect::SHOT_RIGHTGUN  : arms[0].shotTimer = 0; break;
+            case TR::Effect::SHOT_LEFTGUN   : arms[1].shotTimer = 0; break;
+            case TR::Effect::MESH_SWAP_1    : 
+            case TR::Effect::MESH_SWAP_2    : 
+            case TR::Effect::MESH_SWAP_3    : Character::cmdEffect(fx);
+            case 26 : break; // TODO TR2 reset_hair
+            case 32 : break; // TODO TR3 footprint
+            default : LOG("unknown effect command %d (anim %d)\n", fx, animation.index); ASSERT(false);
         }
     }
 
-    virtual void hit(int damage, Controller *enemy = NULL) {
-        health -= damage;
-        if (enemy && health > 0)
-            playSound(TR::SND_HIT, pos, Sound::PAN | Sound::REPLAY);
+    void addSparks(uint32 mask) {
+        Sphere spheres[MAX_SPHERES];
+        int count;
+        getSpheres(spheres, count);
+        for (int i = 0; i < count; i++)
+            if (mask & (1 << i)) {
+                vec3 sprPos = spheres[i].center + (vec3(randf(), randf(), randf()) * 2.0f - 1.0f) * spheres[i].radius;
+                game->addEntity(TR::Entity::SPARKLES, getRoomIndex(), sprPos);
+            }
+    }
+
+    void addBlood(const vec3 &sprPos, const vec3 &sprVel) {
+        Sprite *sprite = (Sprite*)game->addEntity(TR::Entity::BLOOD, getRoomIndex(), sprPos, 0);
+        if (sprite)
+            sprite->velocity = sprVel;
+    }
+
+    void addBlood(float radius, float height, const vec3 &sprVel) {
+        vec3 p = pos + vec3((randf() * 2.0f - 1.0f) * radius, -randf() * height, (randf() * 2.0f - 1.0f) * radius);
+        addBlood(p, sprVel);
+    }
+
+    void addBloodSpikes() {
+        float ang = randf() * PI * 2.0f;
+        addBlood(64.0f,  512.0f, vec3(sinf(ang), 0.0f, cosf(ang)) * 20.0f);
+    }
+
+    void addBloodBlade() {
+        float ang = angle.y + (randf() - 0.5f) * 30.0f * DEG2RAD;
+        addBlood(64.0f, 744.0f, vec3(sinf(ang), 0.0f, cosf(ang)) * speed);
+    }
+
+    void addBloodSlam(Controller *trapSlam) {
+        for (int i = 0; i < 6; i++)
+            addBloodSpikes();
+    }
+
+    void bakeEnvironment() {
+        flags.invisible = true;
+        if (!environment)
+            environment = new Texture(256, 256, Texture::RGBA, true, NULL, true, true);
+        Core::beginFrame();
+        game->renderEnvironment(getRoomIndex(), pos - vec3(0.0f, 384.0f, 0.0f), &environment, 0, Core::passCompose);
+        environment->generateMipMap();
+        Core::endFrame();
+        flags.invisible = false;
+    }
+
+    virtual void hit(float damage, Controller *enemy = NULL, TR::HitType hitType = TR::HIT_DEFAULT) {
+        if (dozy || level->isCutsceneLevel()) return;
+
+        if (health <= 0.0f) return;
+
+        damageTime = LARA_DAMAGE_TIME;
+
+        Character::hit(damage, enemy, hitType);
+
+        switch (hitType) {
+            case TR::HIT_DART      : addBlood(enemy->pos, vec3(0));
+            case TR::HIT_BLADE     : addBloodBlade(); break;
+            case TR::HIT_SPIKES    : addBloodSpikes(); break;
+            case TR::HIT_SWORD     : addBloodBlade(); break;
+            case TR::HIT_SLAM      : addBloodSlam(enemy); break;
+            case TR::HIT_LIGHTNING : lightning = (Lightning*)enemy; break;
+            default                : ;
+        }
+
+        if (health > 0.0f)
+            return;
+
+        game->stopTrack();
+
+        Core::lightColor[1 + 0] = Core::lightColor[1 + 1] = vec4(0, 0, 0, 1);
+        arms[0].shotTimer = arms[1].shotTimer = MUZZLE_FLASH_TIME + 1.0f;
+        arms[0].tracking  = arms[1].tracking  = NULL;
+        arms[0].target    = arms[1].target    = NULL;
+        viewTarget        = NULL;
+        animation.overrideMask = 0;
+
+        switch (hitType) {
+            case TR::HIT_FALL : {
+                animation.setState(STATE_DEATH);
+                break;
+            }
+            case TR::HIT_BOULDER : {
+                animation.setAnim(ANIM_DEATH_BOULDER);
+
+                vec3 v(0.0f);
+                if (enemy && enemy->getEntity().type == TR::Entity::TRAP_BOULDER) {
+                    angle = enemy->angle;
+                    TR::Level::FloorInfo info;
+                    getFloorInfo(getRoomIndex(), pos, info);
+                    vec3 d = getDir();
+                    v = info.getSlant(d);
+                    float dp = d.dot(v);
+                    if (fabsf(dp) < 0.999)
+                        angle.x = -acosf(dp);
+                    v = ((TrapBoulder*)enemy)->velocity * 2.0f;
+                }
+
+                for (int i = 0; i < 15; i++)
+                    addBlood(256.0f, 512.0f, v);
+                break;
+            }
+            case TR::HIT_SPIKES : {
+                pos.y = enemy->pos.y;
+                animation.setAnim(ANIM_DEATH_SPIKES);
+                for (int i = 0; i < 19; i++)
+                    addBloodSpikes();
+                break;
+            }
+            case TR::HIT_REX : {
+                pos   = enemy->pos;
+                angle = enemy->angle;
+
+                meshSwap(1, TR::MODEL_LARA_SPEC, BODY_UPPER | BODY_LOWER);
+                meshSwap(2, level->extra.weapons[Weapon::SHOTGUN], 0);
+                meshSwap(3, level->extra.weapons[Weapon::UZIS],    0);
+
+                animation.setAnim(level->models[TR::MODEL_LARA_SPEC].animation + 1);
+                break;
+            }
+            case TR::HIT_MIDAS : {
+            // generate environment map for reflections
+                bakeEnvironment();
+            // set death animation
+                animation.setAnim(level->models[TR::MODEL_LARA_SPEC].animation + 1);
+                game->getCamera()->doCutscene(pos, angle.y);
+                break;
+            }
+            default : ;
+        }
+
+        if (hitType != TR::HIT_LAVA) {
+            TR::Level::FloorInfo info;
+            getFloorInfo(getRoomIndex(), pos, info);
+
+            if (info.lava && info.floor == pos.y)
+                hitType = TR::HIT_LAVA;
+        }
+
+        if (hitType == TR::HIT_LAVA) {
+            for (int i = 0; i < 10; i++)
+                Flame::add(game, this, int(randf() * 24.0f));
+        }
     };
+
+    bool useItem(TR::Entity::Type item) {
+        if (game->isCutscene()) return false;
+
+        switch (item) {
+            case TR::Entity::INV_PISTOLS       : wpnChange(Lara::Weapon::PISTOLS); break;
+            case TR::Entity::INV_SHOTGUN       : wpnChange(Lara::Weapon::SHOTGUN); break;
+            case TR::Entity::INV_MAGNUMS       : wpnChange(Lara::Weapon::MAGNUMS); break;
+            case TR::Entity::INV_UZIS          : wpnChange(Lara::Weapon::UZIS);    break;
+            case TR::Entity::INV_MEDIKIT_SMALL :
+            case TR::Entity::INV_MEDIKIT_BIG   :
+                damageTime = LARA_DAMAGE_TIME;
+                health = min(LARA_MAX_HEALTH, health + (item == TR::Entity::INV_MEDIKIT_SMALL ? LARA_MAX_HEALTH / 2 : LARA_MAX_HEALTH));
+                game->playSound(TR::SND_HEALTH, pos, Sound::PAN);
+                //TODO: remove medikit item
+                break;
+            case TR::Entity::INV_PUZZLE_1 :
+            case TR::Entity::INV_PUZZLE_2 :
+            case TR::Entity::INV_PUZZLE_3 :
+            case TR::Entity::INV_PUZZLE_4 :
+            case TR::Entity::INV_KEY_1    :
+            case TR::Entity::INV_KEY_2    :
+            case TR::Entity::INV_KEY_3    :
+            case TR::Entity::INV_KEY_4    :
+                if (usedKey == item)
+                    return false;
+                usedKey = item;
+                break;
+            case TR::Entity::INV_LEADBAR  :
+                for (int i = 0; i < level->entitiesCount; i++) {
+                    const TR::Entity &e = level->entities[i];
+                    if (e.controller && e.type == TR::Entity::MIDAS_HAND) {
+                        MidasHand *controller = (MidasHand*)e.controller;
+                        if (controller->interaction) {
+                            controller->invItem = item;
+                            return false; // remove item from inventory
+                        }
+                        return true;
+                    }
+                }
+                return false;
+            default : return false;
+        }
+        return true;
+    }
 
     bool waterOut() {
         // TODO: playSound 36
@@ -1062,22 +1596,20 @@ struct Lara : Character {
         vec3 dst = pos + getDir() * (LARA_RADIUS + 32.0f);
 
         TR::Level::FloorInfo info;
-        level->getFloorInfo(getRoomIndex(), int(pos.x), int(pos.y), int(pos.z), info);
+        getFloorInfo(getRoomIndex(), pos, info);
         int roomAbove = info.roomAbove;
         if (roomAbove == TR::NO_ROOM)
             return false;
 
-        level->getFloorInfo(roomAbove, int(dst.x), int(dst.y), int(dst.z), info);
+        getFloorInfo(roomAbove, dst, info);
 
         int h = int(pos.y - info.floor);
 
         if (h >= 0 && h <= (256 + 128) && (state == STATE_SURF_TREAD || animation.setState(STATE_SURF_TREAD)) && animation.setState(STATE_STOP)) {
             alignToWall(LARA_RADIUS);
-            roomPrev = getRoomIndex();
-            getEntity().room = roomAbove;
-            pos.y    = float(info.floor);
+            roomIndex = roomAbove;
+            pos.y    = info.floor;
             specular = LARA_WET_SPECULAR;
-            updateEntity();
             move();
             return true;
         }
@@ -1085,221 +1617,496 @@ struct Lara : Character {
         return false;
     }
 
+    int goUnderwater() {
+        angle.x = -PI * 0.25f;
+        game->waterDrop(pos, 256.0f, 0.2f);
+        stand = STAND_UNDERWATER;
+        return animation.setAnim(ANIM_TO_UNDERWATER);
+    }
+
     bool doPickUp() {
+        if (!animation.canSetState(STATE_PICK_UP))
+            return false;
+
         int room = getRoomIndex();
-        TR::Entity &e = getEntity();
+
+        pickupListCount = 0;
 
         for (int i = 0; i < level->entitiesCount; i++) {
-            TR::Entity &item = level->entities[i];
-            if (item.room == room && !item.flags.invisible) {
-                if (abs(item.x - e.x) > 256 || abs(item.z - e.z) > 256)
-                    continue;
+            TR::Entity &entity = level->entities[i];
+            if (!entity.controller || !entity.isPickup())
+                continue;
 
-                if (item.isItem()) {
-                    lastPickUp = i;
-                    angle.x = 0.0f;
-                    pos = ((Controller*)item.controller)->pos;
-                    if (stand == STAND_UNDERWATER) { // TODO: lerp to pos/angle
-                        pos -= getDir() * 256.0f;
-                        pos.y -= 256;
-                    }
-                    updateEntity();
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
+            Controller *controller = (Controller*)entity.controller;
 
-    bool checkAngle(TR::angle rotation) {
-        return fabsf(shortAngle(rotation, getEntity().rotation)) < PI * 0.25f;
-    }
+            if (controller->getRoomIndex() != room || controller->flags.invisible || !canPickup(controller))
+                continue;
 
-    bool useItem(TR::Entity::Type item, TR::Entity::Type slot) {
-        if (item == TR::Entity::NONE) {
-            switch (slot) {
-                case TR::Entity::HOLE_KEY    : item = TR::Entity::KEY_1;    break;      // TODO: 1-4
-                case TR::Entity::HOLE_PUZZLE : item = TR::Entity::PUZZLE_1; break;
-                default : return false;
-            }
+            ASSERT(pickupListCount < COUNT(pickupList));
+            pickupList[pickupListCount++] = controller;
         }
 
-        if (inventory.getCount(item) > 0) {
-            inventory.remove(item);
+        if (pickupListCount > 0) {
+            state = STATE_PICK_UP;
             return true;
         }
+
         return false;
     }
 
-    void checkTrigger() {
-        if (actionCommand) return;
+    bool canPickup(Controller *controller) {
+        TR::Entity::Type type = controller->getEntity().type;
 
-        TR::Entity &e = getEntity();
+        // get limits
+        TR::Limits::Limit *limit;
+        switch (type) {
+            case TR::Entity::SCION_PICKUP_QUALOPEC : limit = &TR::Limits::SCION; break;
+            case TR::Entity::SCION_PICKUP_HOLDER   : limit = &TR::Limits::SCION_HOLDER; break;
+            default : limit = level->rooms[getRoomIndex()].flags.water ? &TR::Limits::PICKUP_UNDERWATER : &TR::Limits::PICKUP;
+        }
+
+        if (!checkInteraction(controller, limit, true))
+            return false;
+
+        if (stand == Character::STAND_UNDERWATER)
+            angle.x = -25 * DEG2RAD;
+
+        // set new state
+        switch (type) {
+            case TR::Entity::SCION_PICKUP_QUALOPEC :
+                animation.setAnim(level->models[TR::MODEL_LARA_SPEC].animation);
+                game->getCamera()->doCutscene(pos, angle.y);
+                break;
+            case TR::Entity::SCION_PICKUP_HOLDER   :
+                animation.setAnim(level->models[TR::MODEL_LARA_SPEC].animation);
+                
+                angle = controller->angle;
+                pos   = controller->pos - vec3(0, -280, LARA_RADIUS + 512).rotateY(angle.y);
+
+                game->getCamera()->doCutscene(pos, angle.y - PI * 0.5f);
+                break;
+            default : ; 
+        }
+
+        return true;
+    }
+
+    int doTutorial(int track) {
+        if (level->version == TR::VER_TR1_PC || level->version == TR::VER_TR1_PSX)
+            switch (track) { // GYM tutorial routine
+                case 28 : if (level->state.tracks[track].once && state == STATE_UP_JUMP) track = 29; break;
+                case 37 : 
+                case 41 : if (state != STATE_HANG) return 0; break;
+                case 42 : if (level->state.tracks[track].once && state == STATE_HANG) track = 43; break;
+                case 49 : if (state != STATE_SURF_TREAD) return 0; break;
+                case 50 : // end of GYM
+                    if (level->state.tracks[track].once) {
+                        timer += Core::deltaTime;
+                        if (timer > 3.0f)
+                            game->loadNextLevel();
+                    } else {
+                        if (state != STATE_WATER_OUT)
+                            return 0;
+                        timer = 0.0f;
+                    }
+                    break;
+            }
+        return track;
+    }
+
+
+    bool checkInteraction(Controller *controller, const TR::Limits::Limit *limit, bool action) {
+        if ((state != STATE_STOP && state != STATE_TREAD && state != STATE_PUSH_PULL_READY) || !action || !emptyHands())
+            return false;
+
+        vec3 tmpAngle = controller->angle;
+        vec3 ctrlAngle = controller->angle;
+        if (stand == STAND_UNDERWATER)
+            ctrlAngle.x = -25 * DEG2RAD;
+        if (!limit->alignAngle)
+            ctrlAngle.y = angle.y;
+        controller->angle = ctrlAngle;
+        mat4 m = controller->getMatrix();
+        controller->angle = tmpAngle;
+
+        float fx = 0.0f;
+        if (!limit->alignHoriz)
+            fx = (m.transpose() * vec4(pos - controller->pos, 0.0f)).x;
+
+        vec3 targetPos = controller->pos + (m * vec4(fx, limit->dy, limit->dz, 0.0f)).xyz;
+
+        vec3 deltaAbs = pos - targetPos;
+
+        vec3 deltaRel = (m.transpose() * vec4(pos - controller->pos, 0.0f)).xyz; // inverse transform
+        
+        // set item orientation to hack limits check
+        if (limit->box.contains(deltaRel)) {
+            float deltaAngY = shortAngle(angle.y, ctrlAngle.y);
+
+            if (stand == STAND_UNDERWATER) {
+                float deltaAngX = shortAngle(angle.x, ctrlAngle.x);
+
+                if (deltaAbs.length() > 64.0f || max(fabs(deltaAngX), fabs(deltaAngY)) > (10.0f * DEG2RAD)) {
+                    pos     -= deltaAbs.normal() * min(deltaAbs.length(), Core::deltaTime * 512.0f);
+                    angle.x += sign(deltaAngX)   * min(fabsf(deltaAngX), Core::deltaTime * (90.0f * DEG2RAD));
+                    angle.y += sign(deltaAngY)   * min(fabsf(deltaAngY), Core::deltaTime * (90.0f * DEG2RAD));
+                    return false;
+                }
+            }
+
+            if (fabsf(deltaAngY) <= limit->ay * DEG2RAD) {
+            // align
+                if (limit->alignAngle)
+                    angle = controller->angle;
+                else
+                    angle.x = angle.z = 0.0f;
+
+                pos      = targetPos;
+                velocity = vec3(0.0f);
+                speed    = 0.0f;
+
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    void checkTrigger(Controller *controller, bool heavy) {
         TR::Level::FloorInfo info;
-        level->getFloorInfo(e.room, e.x, e.y, e.z, info);
+        getFloorInfo(controller->getRoomIndex(), controller->pos, info);
+
+        if (getEntity().isLara() && info.lava && info.floor == pos.y) {
+            hit(LARA_MAX_HEALTH + 1, NULL, TR::HIT_LAVA);
+            return;
+        }
 
         if (!info.trigCmdCount) return; // has no trigger
 
-        TR::FloorData::TriggerCommand &cmd = info.trigCmd[0];
-        bool isActive = false;
-        switch (cmd.action) {
-            case TR::Action::SECRET   : isActive = level->secrets[cmd.args]; break;
-            case TR::Action::ACTIVATE : isActive = level->entities[cmd.args].flags.active != 0; break;
-            default : isActive = false;
-        }
-
-        if (info.trigInfo.once == 1 && isActive) return; // once trigger is already activated
-
+        TR::Limits::Limit *limit = NULL;
+        bool switchIsDown = false;
+        float timer = info.trigInfo.timer == 1 ? EPS : float(info.trigInfo.timer);
+        int cmdIndex = 0;
         int actionState = state;
+
         switch (info.trigger) {
-            case TR::Level::Trigger::ACTIVATE :
-                if (isActive) return;
+            case TR::Level::Trigger::ACTIVATE : break;
+
+            case TR::Level::Trigger::SWITCH : {
+                Switch *controller = (Switch*)level->entities[info.trigCmd[cmdIndex++].args].controller;
+
+                if (controller->flags.state == TR::Entity::asNone) {
+                    limit = state == STATE_STOP ? &TR::Limits::SWITCH : &TR::Limits::SWITCH_UNDERWATER;
+                    if (checkInteraction(controller, limit, Input::state[cAction])) {
+                        actionState = (controller->state == Switch::STATE_DOWN && stand == STAND_GROUND) ? STATE_SWITCH_UP : STATE_SWITCH_DOWN;
+
+                        int animIndex;
+                        switch (controller->getEntity().type) {
+                            case TR::Entity::SWITCH_BUTTON : animIndex = ANIM_PUSH_BUTTON; break;
+                            case TR::Entity::SWITCH_BIG    : animIndex = controller->state == Switch::STATE_DOWN ? ANIM_SWITCH_BIG_UP : ANIM_SWITCH_BIG_DOWN; break;
+                            default : animIndex = -1;
+                        }
+
+                        if (animation.setState(actionState, animIndex)) 
+                            controller->activate();
+                    }
+                }
+
+                if (!controller->setTimer(timer))
+                    return;
+
+                switchIsDown = controller->state == Switch::STATE_DOWN;
                 break;
-            case TR::Level::Trigger::PAD :
-                if (stand != STAND_GROUND || isActive) return;
-                break;
-            case TR::Level::Trigger::SWITCH :
-                actionState = (isActive && stand == STAND_GROUND) ? STATE_SWITCH_UP : STATE_SWITCH_DOWN;
-                if (!isPressed(ACTION) || state == actionState || !emptyHands())
-                    return;
-                if (!checkAngle(level->entities[info.trigCmd[0].args].rotation))
-                    return;
-                break;
-            case TR::Level::Trigger::KEY :
-                if (level->entities[info.trigCmd[0].args].flags.active)
-                    return;
-                actionState = level->entities[info.trigCmd[0].args].type == TR::Entity::HOLE_KEY ? STATE_USE_KEY : STATE_USE_PUZZLE;
-                if (isActive || !isPressed(ACTION) || state == actionState || !emptyHands())   // TODO: STATE_USE_PUZZLE
-                    return;
-                if (!checkAngle(level->entities[info.trigCmd[0].args].rotation))
-                    return;
-                if (animation.canSetState(actionState)) {
-                    if (!useItem(TR::Entity::NONE, level->entities[info.trigCmd[0].args].type)) {
-                        playSound(TR::SND_NO, pos, Sound::PAN);
+            }
+
+            case TR::Level::Trigger::KEY : {
+                TR::Entity &entity = level->entities[info.trigCmd[cmdIndex++].args];
+                KeyHole *controller = (KeyHole*)entity.controller;
+
+                if (controller->flags.state == TR::Entity::asNone) {
+                    if (controller->flags.active == TR::ACTIVE || state != STATE_STOP)
+                        return;
+
+                    actionState = entity.isPuzzleHole() ? STATE_USE_PUZZLE : STATE_USE_KEY;
+                    if (!animation.canSetState(actionState))
+                        return;
+
+                    limit = actionState == STATE_USE_PUZZLE ? &TR::Limits::PUZZLE_HOLE : &TR::Limits::KEY_HOLE;
+                    if (!checkInteraction(controller, limit, isPressed(ACTION) || usedKey != TR::Entity::LARA))
+                        return;
+
+                    if (usedKey == TR::Entity::LARA) {
+                        if (isPressed(ACTION) && !game->invChooseKey(entity.type))
+                            game->playSound(TR::SND_NO, pos, Sound::PAN); // no compatible items in inventory
                         return;
                     }
-                } else
+
+                    if (TR::Entity::convToInv(TR::Entity::getItemForHole(entity.type)) != usedKey) { // check compatibility if user select other
+                        game->playSound(TR::SND_NO, pos, Sound::PAN); // uncompatible item
+                        return;
+                    }
+
+                    keyHole = controller;
+                    game->invUse(usedKey);
+
+                    animation.setState(actionState);
+                }
+
+                if (controller->flags.state != TR::Entity::asInactive)
                     return;
-                lastPickUp = info.trigCmd[0].args; // TODO: it's not pickup, it's key/puzzle hole
+
                 break;
-            case TR::Level::Trigger::PICKUP :
-                if (!isActive)  // check if item is not picked up
-                    return;
-                break;
-            default :
-                LOG("unsupported trigger type %d\n", info.trigger);
-                return;
-        }
-
-        // try to activate Lara state
-        if (!animation.setState(actionState)) return;
-
-        if (info.trigger == TR::Level::Trigger::SWITCH || info.trigger == TR::Level::Trigger::KEY) {
-            if (info.trigger == TR::Level::Trigger::KEY)
-                level->entities[info.trigCmd[0].args].flags.active = true;
-
-            TR::Entity &p = level->entities[info.trigCmd[0].args];
-            angle.y = p.rotation;
-            angle.x = 0;
-            pos = ((Controller*)p.controller)->pos + vec3(sinf(angle.y), 0, cosf(angle.y)) * (stand == STAND_GROUND ? 384.0f : 128.0f);
-            velocity = vec3(0.0f);
-            updateEntity();
-        }
-
-        // build trigger activation chain
-        ActionCommand *actionItem = &actionList[1];
-
-        Controller *controller = this;
-        for (int i = 0; i < info.trigCmdCount; i++) {
-            if (!controller) {
-                LOG("! next activation entity %d has no controller\n", level->entities[info.trigCmd[i].args].type);
-                playSound(TR::SND_NO, pos, 0);
-                return;
             }
 
-            if (info.trigger == TR::Level::Trigger::KEY && i == 0) continue; // skip key שך puzzle hole
+            case TR::Level::Trigger::PICKUP : {
+                Controller *controller = (Controller*)level->entities[info.trigCmd[cmdIndex++].args].controller;
+                if (!controller->flags.invisible)
+                    return;
+                break;
+            }
 
-            TR::FloorData::TriggerCommand &cmd = info.trigCmd[i];
+            case TR::Level::Trigger::COMBAT :
+                if (emptyHands())
+                    return;
+                break;
+
+            case TR::Level::Trigger::PAD :
+            case TR::Level::Trigger::ANTIPAD :
+                if (pos.y != info.floor) return;
+                break;
+
+            case TR::Level::Trigger::HEAVY :
+                if (!heavy) return;
+                break;
+            case TR::Level::Trigger::DUMMY :
+                return;
+        }
+
+        bool needFlip = false;
+        TR::Effect effect = TR::Effect::NONE;
+
+        int         cameraIndex  = -1;
+        Controller *cameraTarget = NULL;
+        Camera *camera = (Camera*)level->cameraController;
+
+        while (cmdIndex < info.trigCmdCount) {
+            TR::FloorData::TriggerCommand &cmd = info.trigCmd[cmdIndex++];
+
             switch (cmd.action) {
-                case TR::Action::CAMERA_SWITCH :
-                    *actionItem = ActionCommand(entity, cmd.action, cmd.args, (float)info.trigCmd[++i].delay);    // camera switch uses next command for delay timer
-                    break;
-                default :
-                    *actionItem = ActionCommand(entity, cmd.action, cmd.args, info.trigInfo.timer);
-            }
+                case TR::Action::ACTIVATE : {
+                    TR::Entity &e = level->entities[cmd.args];
+                    Controller *controller = (Controller*)e.controller;
+                    ASSERT(controller);
+                    TR::Entity::Flags &flags = controller->flags;
 
-            actionItem->next = (i < info.trigCmdCount - 1) ? actionItem + 1 : NULL;
-            actionItem++;
+                    if (flags.once)
+                        break;
+                    controller->timer = timer;
+
+                    if (info.trigger == TR::Level::Trigger::SWITCH)
+                        flags.active ^= info.trigInfo.mask;
+                    else if (info.trigger == TR::Level::Trigger::ANTIPAD)
+                        flags.active &= ~info.trigInfo.mask;
+                    else
+                        flags.active |= info.trigInfo.mask;
+
+                    if (flags.active != TR::ACTIVE)
+                        break;
+
+                    flags.once |= info.trigInfo.once;
+                    
+                    controller->activate();
+                    break;
+                }
+                case TR::Action::CAMERA_SWITCH : {
+                    TR::FloorData::TriggerCommand &cam = info.trigCmd[cmdIndex++];
+                    if (level->cameras[cmd.args].flags.once)
+                        break;
+
+                    if (info.trigger == TR::Level::Trigger::COMBAT)
+                        break;
+                    if (info.trigger == TR::Level::Trigger::SWITCH && info.trigInfo.timer && switchIsDown)
+                        break;
+ 
+                    if (info.trigger == TR::Level::Trigger::SWITCH || cmd.args != camera->viewIndexLast) {
+                        level->cameras[cmd.args].flags.once |= cam.once;
+                        camera->setView(cmd.args, cam.timer == 1 ? EPS : float(cam.timer), cam.speed * 8.0f);
+                    }
+
+                    if (cmd.args == camera->viewIndexLast)
+                        cameraIndex = cmd.args;
+
+                    break;
+                }
+                case TR::Action::FLOW :
+                    applyFlow(level->cameras[cmd.args]);
+                    break;
+                case TR::Action::FLIP : {
+                    TR::ByteFlags &flip = level->state.flipmaps[cmd.args];
+
+                    if (flip.once)
+                        break;
+
+                    if (info.trigger == TR::Level::Trigger::SWITCH)
+                        flip.active ^= info.trigInfo.mask;
+                    else
+                        flip.active |= info.trigInfo.mask;
+
+                    if (flip.active == TR::ACTIVE)
+                        flip.once |= info.trigInfo.once;
+
+                    if ((flip.active == TR::ACTIVE) ^ level->state.flags.flipped)
+                         needFlip = true;
+
+                    break;
+                }
+                case TR::Action::FLIP_ON :
+                    if (level->state.flipmaps[cmd.args].active == TR::ACTIVE && !level->state.flags.flipped)
+                        needFlip = true;
+                    break;
+                case TR::Action::FLIP_OFF :
+                    if (level->state.flipmaps[cmd.args].active == TR::ACTIVE && level->state.flags.flipped)
+                        needFlip = true;
+                    break;
+                case TR::Action::CAMERA_TARGET :
+                    cameraTarget = (Controller*)level->entities[cmd.args].controller;
+                    break;
+                case TR::Action::END :
+                    game->loadNextLevel();
+                    break;
+                case TR::Action::SOUNDTRACK : {
+                    int track = doTutorial(cmd.args);
+
+                    if (track == 0) break;
+
+                // check trigger
+                    TR::ByteFlags &flags = level->state.tracks[track];
+
+                    if (flags.once)
+                        break;
+
+                    if (info.trigger == TR::Level::Trigger::SWITCH)
+                        flags.active ^= info.trigInfo.mask;
+                    else if (info.trigger == TR::Level::Trigger::ANTIPAD)
+                        flags.active &= ~info.trigInfo.mask;
+                    else
+                        flags.active |= info.trigInfo.mask;
+
+                    if ( (flags.active == TR::ACTIVE) || (((level->version & (TR::VER_TR2 | TR::VER_TR3))) && flags.active) ) {
+                        flags.once |= info.trigInfo.once;
+                        game->playTrack(track);
+                    } else
+                        game->stopTrack();
+
+                    break;
+                }
+                case TR::Action::EFFECT :
+                    effect = TR::Effect(cmd.args);
+                    break;
+                case TR::Action::SECRET :
+                    if (!(level->state.progress.secrets & (1 << cmd.args))) {
+                        level->state.progress.secrets |= 1 << cmd.args;
+                        if (!game->playSound(TR::SND_SECRET, pos))
+                            game->playTrack(TR::TRACK_TR1_SECRET);
+                    }
+                    break;
+            }
         }
 
-        actionList[0].next = &actionList[1];
-        actionCommand = &actionList[0];
+        if (cameraTarget && (camera->state == Camera::STATE_STATIC || cameraIndex == -1))
+           camera->viewTarget = cameraTarget;
 
-        if (info.trigger != TR::Level::Trigger::KEY)
-            activateNext();
-    }
+        if (!cameraTarget && cameraIndex > -1)
+            camera->viewIndex = cameraIndex;
 
-    vec3 getViewPoint() {
-        vec3 offset = chestOffset = animation.getJoints(getMatrix(), 7).pos;
-        if (stand != STAND_UNDERWATER)
-            offset.y -= 256.0f;
-        if (!emptyHands())
-            offset.y -= 256.0f;
-
-        return offset;
+        if (needFlip) {
+            level->state.flags.flipped = !level->state.flags.flipped;
+            game->setEffect(this, effect);
+        }
     }
 
     virtual Stand getStand() {
+        if (dozy) return STAND_UNDERWATER;
+
         if (state == STATE_HANG || state == STATE_HANG_LEFT || state == STATE_HANG_RIGHT) {
             if (input & ACTION)
                 return STAND_HANG;
-            animation.setAnim(ANIM_HANG_FALL);
+            animation.setAnim(ANIM_FALL_HANG);
             velocity = vec3(0.0f);
             pos.y += 128.0f;
-            updateEntity();
             return STAND_AIR;
         }
 
-        if (state == STATE_HANDSTAND || state == STATE_HANG_UP)
+        if (state == STATE_HANDSTAND || (state == STATE_HANG_UP && animation.index != ANIM_CLIMB_JUMP))
             return STAND_HANG;
 
-        if (stand == STAND_ONWATER && state != STATE_DIVE && state != STATE_STOP)
-            return stand;
-
-        if (getRoom().flags.water) {
-            wpnHide();
-            return STAND_UNDERWATER;
+        if (stand == STAND_ONWATER && state != STATE_STOP) {
+            if (!getRoom().flags.water && state != STATE_WATER_OUT)
+                return STAND_AIR;
+            if (state != STATE_DIVE)
+                return stand;
         }
 
-        TR::Entity &e = getEntity();
         TR::Level::FloorInfo info;
-        level->getFloorInfo(e.room, e.x, e.y, e.z, info);
+        getFloorInfo(getRoomIndex(), pos, info);
 
-        if (stand == STAND_SLIDE || (stand == STAND_AIR && velocity.y > 0) || stand == STAND_GROUND) {
-            if (e.y + 8 >= info.floor && (abs(info.slantX) > 2 || abs(info.slantZ) > 2)) {
-                if (stand == STAND_AIR)
-                    playSound(TR::SND_LANDING, pos, Sound::Flags::PAN);
-                pos.y = float(info.floor);
-                updateEntity();
+        if (getRoom().flags.water) {
+            if (stand == STAND_UNDERWATER || stand == STAND_ONWATER)
+                return stand;
+            wpnHide();
+            if (stand == STAND_AIR) {
+                //if (stand != STAND_UNDERWATER && stand != STAND_ONWATER && (state != STATE_FALL && state != STATE_REACH && state != STATE_SWAN_DIVE && state != STATE_FAST_DIVE))
+                //    animation.setAnim(ANIM_FALL_FORTH);
+                stopScreaming();
+                return STAND_UNDERWATER;
+            } else {
+                pos.y = info.roomCeiling;
+                return STAND_ONWATER;
+            }
+        }
 
-                if (stand == STAND_GROUND || stand == STAND_AIR)
+        if ((stand == STAND_SLIDE || stand == STAND_GROUND) && (state != STATE_FORWARD_JUMP && state != STATE_BACK_JUMP)) {
+            if (pos.y + 8 >= info.floor && (abs(info.slantX) > 2 || abs(info.slantZ) > 2)) {
+                pos.y = info.floor;
+
+                if (stand == STAND_GROUND)
                     slideStart();
 
                 return STAND_SLIDE;
             }
         }
 
-        int extra = stand != STAND_AIR ? 256 : 0;
+        int extra = (stand != STAND_AIR && stand != STAND_SLIDE) ? 256 : 0;
 
-        if (e.y + extra >= info.floor && !(stand == STAND_AIR && velocity.y < 0)) {
+        if (pos.y + extra >= info.floor && !(stand == STAND_AIR && velocity.y < 0)) {
             if (stand != STAND_GROUND) {
-                pos.y = float(info.floor);
-                updateEntity();
+                pos.y = info.floor;
+            // get damage from falling
+                if (velocity.y > 0.0f) {
+                    stopScreaming();
+                    if (state == STATE_FAST_DIVE && velocity.y > 133.0f) {
+                        hit(health + 1.0f, NULL, TR::HIT_FALL);
+                    } else {
+                        float v = velocity.y - 140.0f;
+                        if (v > 14.0f)
+                            hit(health + 1.0f, NULL, TR::HIT_FALL);
+                        else
+                            if (v > 0.0f)
+                                hit(v * v * LARA_MAX_HEALTH / 196.0f, NULL, TR::HIT_FALL);
+                    }
+                }
             }
+            if (stand == STAND_UNDERWATER || stand == STAND_ONWATER)
+                animation.setAnim(ANIM_STAND);
             return STAND_GROUND;
         }
 
         return STAND_AIR;
+    }
+
+    void stopScreaming() {
+        if (velocity.y >= 154.0f)
+            Sound::stop(TR::SND_SCREAM);
     }
 
     virtual int getHeight() {
@@ -1310,6 +2117,9 @@ struct Lara : Character {
 
     virtual int getStateAir() {
         angle.x = 0.0f;
+
+        if (velocity.y > 131.0f && state != STATE_SWAN_DIVE && state != STATE_FAST_DIVE)
+            return STATE_FALL;
 
         if (state == STATE_REACH && getDir().dot(vec3(velocity.x, 0.0f, velocity.z)) < 0)
             velocity.x = velocity.z = 0.0f;
@@ -1322,39 +2132,42 @@ struct Lara : Character {
 
             vec3 p = vec3(pos.x, bounds.min.y, pos.z);
 
-            Collision c = Collision(level, getRoomIndex(), p, getDir() * 32.0f, vec3(0.0f), LARA_RADIUS, angleExt, 0, 0, 0, 0);
+            Collision c = Collision(this, getRoomIndex(), p, getDir() * 128.0f, vec3(0.0f), LARA_RADIUS, angleExt, 0, 0, 0, 0);
 
             if (c.side != Collision::FRONT)
                 return state;
 
-            int floor = c.info[Collision::FRONT].floor;
-            int hands = int(bounds.min.y);
+            float floor   = c.info[Collision::FRONT].floor;
+            float ceiling = c.info[Collision::FRONT].ceiling;
+            float hands   = bounds.min.y;
 
-            if (abs(floor - hands) < 128) {
+            if (fabsf(floor - hands) < 64 && floor != ceiling) {
                 alignToWall(-LARA_RADIUS);
                 pos.y = float(floor + LARA_HANG_OFFSET);
                 stand = STAND_HANG;
-                updateEntity();
 
                 if (state == STATE_REACH) {
-                    vec3 p = pos + getDir() * 256.0f;
+                    velocity = vec3(0.0f);
                     TR::Level::FloorInfo info;
-                    level->getFloorInfo(getRoomIndex(), int(p.x), int(p.y), int(p.z), info);
-                    int h = info.ceiling - floor;
+                    getFloorInfo(getRoomIndex(), pos + getDir() * 256.0f, info);
+                    int h = int(info.ceiling - floor);
                     return animation.setAnim((h > 0 && h < 400) ? ANIM_HANG_SWING : ANIM_HANG);
                 } else
                     return animation.setAnim(ANIM_HANG, -15);
             }
         }
 
-        if (state == STATE_FORWARD_JUMP) {
+        if (state == STATE_FORWARD_JUMP || state == STATE_FALL_BACK) {
             if (emptyHands()) {
                 if (input & ACTION) return STATE_REACH;
-                if ((input & (FORTH | WALK)) == (FORTH | WALK)) return STATE_SWAN_DIVE;
+                if ((input & (JUMP | FORTH | WALK)) == (JUMP | FORTH | WALK)) return STATE_SWAN_DIVE;
             }
         } else
-            if (state != STATE_SWAN_DIVE && state != STATE_REACH && state != STATE_FALL && state != STATE_UP_JUMP && state != STATE_BACK_JUMP && state != STATE_LEFT_JUMP && state != STATE_RIGHT_JUMP)
-                return animation.setAnim(ANIM_FALL);
+            if (state != STATE_FALL && state != STATE_FALL_BACK && state != STATE_SWAN_DIVE && state != STATE_FAST_DIVE && state != STATE_REACH && state != STATE_UP_JUMP && state != STATE_BACK_JUMP && state != STATE_LEFT_JUMP && state != STATE_RIGHT_JUMP)
+                return animation.setAnim(ANIM_FALL_FORTH);// (state == STATE_FAST_BACK || state == STATE_SLIDE_BACK || state == STATE_ROLL_2) ? ANIM_FALL_BACK :  ANIM_FALL_FORTH);
+
+        if (state == STATE_SWAN_DIVE)
+            return STATE_FAST_DIVE;
 
         return state;
     }
@@ -1378,37 +2191,42 @@ struct Lara : Character {
     }
 
     Block* getBlock() {
-        int y = int(pos.y);
-
         for (int i = 0; i < level->entitiesCount; i++) {
             TR::Entity &e = level->entities[i];
+            if (!e.controller || !e.isBlock())
+                continue;
 
-            int q = entityQuadrant(e);
-            int dx = abs(int(pos.x) - e.x);
-            int dz = abs(int(pos.z) - e.z);
+            Block *block = (Block*)e.controller;
+            float oldAngle = block->angle.y;
+            block->angle.y = angleQuadrant(angle.y) * (PI * 0.5f);
 
-            if (q > -1 && e.isBlock() && dx < 1024 && dz < 1024 && e.y == y && alignToWall(-LARA_RADIUS, q, 64 + int(LARA_RADIUS), 512 - int(LARA_RADIUS))) {
-                Block *block = (Block*)e.controller;
-                block->angle.y = angle.y;
-                block->updateEntity();
-                return block;
+            if (!checkInteraction(block, &TR::Limits::BLOCK, (input & ACTION) != 0)) {
+                block->angle.y = oldAngle;
+                continue;
             }
+
+            return block;
         }
         return NULL;
     }
 
     virtual int getStateGround() {
+        int res = STATE_STOP;
         angle.x = 0.0f;
 
-        if ((input & ACTION) && emptyHands() && doPickUp())
-            return STATE_PICK_UP;
+        if ((input == ACTION) && (state == STATE_STOP) && emptyHands() && doPickUp())
+            return state;
 
         if ((input & (FORTH | ACTION)) == (FORTH | ACTION) && (animation.index == ANIM_STAND || animation.index == ANIM_STAND_NORMAL) && emptyHands() && collision.side == Collision::FRONT) { // TODO: get rid of animation.index
-            int floor = collision.info[Collision::FRONT].floor;
-            int h = (int)pos.y - floor;
+            float floor   = collision.info[Collision::FRONT].floor;
+            float ceiling = collision.info[Collision::FRONT].ceiling; 
+
+            float h = pos.y - floor;
 
             int aIndex = animation.index;
-            if (h <= 2 * 256 + 128) {
+            if (floor == ceiling || h < 256)
+                ;// do nothing
+            else if (h <= 2 * 256 + 128) {
                 aIndex = ANIM_CLIMB_2;
                 pos.y  = floor + 512.0f;
             } else if (h <= 3 * 256 + 128) {
@@ -1423,18 +2241,30 @@ struct Lara : Character {
             }
         }
 
-        if ( (input & (FORTH | BACK)) == (FORTH | BACK) && (state == STATE_STOP || state == STATE_RUN) )
+        if ( (input & (FORTH | BACK)) == (FORTH | BACK) && (animation.index == ANIM_STAND_NORMAL || state == STATE_RUN) )
             return animation.setAnim(ANIM_STAND_ROLL_BEGIN);
 
         // ready to jump
         if (state == STATE_COMPRESS) {
+            float   ext = angle.y;
             switch (input & (RIGHT | LEFT | FORTH | BACK)) {
-                case RIGHT  : return STATE_RIGHT_JUMP;
-                case LEFT   : return STATE_LEFT_JUMP;
-                case FORTH  : return STATE_FORWARD_JUMP;
-                case BACK   : return STATE_BACK_JUMP;
-                default     : return STATE_UP_JUMP;
+                case RIGHT         : res = STATE_RIGHT_JUMP;    ext +=  PI * 0.5f; break;
+                case LEFT          : res = STATE_LEFT_JUMP;     ext -=  PI * 0.5f; break;
+                case FORTH | LEFT  :
+                case FORTH | RIGHT :
+                case FORTH         : res = STATE_FORWARD_JUMP;  break;
+                case BACK          : res = STATE_BACK_JUMP;     ext +=  PI;        break;
+                default            : res = STATE_UP_JUMP;       break;
             }
+
+            if (res != STATE_UP_JUMP) {
+                vec3 p = pos;
+                collision  = Collision(this, getRoomIndex(), p, vec3(0.0f), vec3(0.0f), LARA_RADIUS * 2.5f, ext, 0, LARA_HEIGHT, 256 + 128, 0xFFFFFF);
+                if (collision.side == Collision::FRONT)
+                    res = STATE_UP_JUMP;
+            }
+
+            return res;
         }
 
         // jump button is pressed
@@ -1449,22 +2279,47 @@ struct Lara : Character {
         }
 
         // walk button is pressed
-        if (input & WALK) {
-            if (input & FORTH) return STATE_WALK;
-            if (input & BACK)  return STATE_BACK;
-            if (input & LEFT)  return STATE_STEP_LEFT;
-            if (input & RIGHT) return STATE_STEP_RIGHT;
-            return STATE_STOP;
+        if ((input & WALK) && animation.index != ANIM_RUN_START) {
+            float ext = angle.y;
+
+            if (input & FORTH) { 
+                if (state == STATE_BACK)
+                    res = STATE_STOP;
+                else
+                    res = STATE_WALK;
+            } else if (input & BACK) {
+                res = STATE_BACK;
+                ext += PI;
+            } else if (input & LEFT) {
+                res = STATE_STEP_LEFT;
+                ext -= PI * 0.5f;
+            } else if (input & RIGHT) {
+                res = STATE_STEP_RIGHT;
+                ext += PI * 0.5f;
+            }
+
+            int maxAscent  = 256 + 128;
+            int maxDescent = maxAscent;
+
+            if (state == STATE_STEP_LEFT || state == STATE_STEP_RIGHT)
+                maxAscent = maxDescent = 64;
+
+            if (state == STATE_STOP && res != STATE_STOP) {
+                vec3 p = pos;
+                collision  = Collision(this, getRoomIndex(), p, vec3(0.0f), vec3(0.0f), LARA_RADIUS * 1.1f, ext, 0, LARA_HEIGHT, maxAscent, maxDescent);
+                if (collision.side == Collision::FRONT)
+                    res = STATE_STOP;
+            }
+
+            return res;
         }
 
         if ((input & ACTION) && emptyHands()) {
             if (state == STATE_PUSH_PULL_READY && (input & (FORTH | BACK))) {
                 int pushState = (input & FORTH) ? STATE_PUSH_BLOCK : STATE_PULL_BLOCK;
                 Block *block = getBlock();
-                if (animation.canSetState(pushState) && block->doMove((input & FORTH) != 0)) {
-                    alignToWall(-LARA_RADIUS);
+                if (block && animation.canSetState(pushState) && block->doMove((input & FORTH) != 0))
                     return pushState;
-                }
             }
 
             if (state == STATE_PUSH_PULL_READY || getBlock())
@@ -1472,9 +2327,11 @@ struct Lara : Character {
         }
 
         // only dpad buttons pressed
-        if (input & FORTH) return STATE_RUN;
-        if (input & BACK)  return STATE_FAST_BACK;
-        if (input & (LEFT | RIGHT)) {
+        if (input & FORTH)
+            res = STATE_RUN;
+        else if (input & BACK)
+            res = STATE_FAST_BACK;
+        else if (input & (LEFT | RIGHT)) {
             if (state == STATE_FAST_TURN)
                 return state;
 
@@ -1482,15 +2339,21 @@ struct Lara : Character {
             if (input & RIGHT) return (state == STATE_TURN_RIGHT && animation.prev == animation.index) ? STATE_FAST_TURN : STATE_TURN_RIGHT;
         }
 
-        return STATE_STOP;
+        if (state == STATE_STOP && res != STATE_STOP) {
+            float ext = angle.y + (res == STATE_RUN ? 0.0f : PI);
+            vec3 p = pos;
+            collision  = Collision(this, getRoomIndex(), p, vec3(0.0f), vec3(0.0f), LARA_RADIUS * 1.1f, ext, 0, LARA_HEIGHT, 256 + 128, 0xFFFFFF);
+            if (collision.side == Collision::FRONT)
+                res = STATE_STOP;
+        }
+
+        return res;
     }
 
     void slideStart() {
-        TR::Entity &e = getEntity();
-
         if (state != STATE_SLIDE && state != STATE_SLIDE_BACK) {
             TR::Level::FloorInfo info;
-            level->getFloorInfo(e.room, e.x, e.y, e.z, info);
+            getFloorInfo(getRoomIndex(), pos, info);
 
             int sx = abs(info.slantX), sz = abs(info.slantZ);
             // get direction
@@ -1508,7 +2371,6 @@ struct Lara : Character {
             }
 
             angle.y = dir;
-            updateEntity();
             animation.setAnim(aIndex);
         }
     }
@@ -1525,8 +2387,7 @@ struct Lara : Character {
         if (input & FORTH) {
             // possibility check
             TR::Level::FloorInfo info;
-            vec3 p = pos + getDir() * (LARA_RADIUS + 2.0f);
-            level->getFloorInfo(getRoomIndex(), (int)p.x, (int)p.y, (int)p.z, info);
+            getFloorInfo(getRoomIndex(), pos + getDir() * (LARA_RADIUS + 2.0f), info);
             if (info.floor - info.ceiling >= LARA_HEIGHT)
                 return (input & WALK) ? STATE_HANDSTAND : STATE_HANG_UP;            
         }
@@ -1534,21 +2395,23 @@ struct Lara : Character {
     }
 
     virtual int getStateUnderwater() {
-        if (input == ACTION && doPickUp())
-            return STATE_PICK_UP;
+        if ((input == ACTION) && (state == STATE_TREAD) && emptyHands() && doPickUp())
+            return state;
 
         if (state == STATE_FORWARD_JUMP || state == STATE_UP_JUMP || state == STATE_BACK_JUMP || state == STATE_LEFT_JUMP || state == STATE_RIGHT_JUMP || state == STATE_FALL || state == STATE_REACH || state == STATE_SLIDE || state == STATE_SLIDE_BACK) {
             game->waterDrop(pos, 256.0f, 0.2f);
-            Sprite::add(game, TR::Entity::WATER_SPLASH, getRoomIndex(), (int)pos.x, (int)pos.y, (int)pos.z);
+            if (level->extra.waterSplash > -1)
+                game->addEntity(TR::Entity::WATER_SPLASH, getRoomIndex(), pos);
             pos.y += 100.0f;
             angle.x = -45.0f * DEG2RAD;
             return animation.setAnim(ANIM_WATER_FALL); // TODO: wronng animation
         }
 
-        if (state == STATE_SWAN_DIVE) {
+        if (state == STATE_SWAN_DIVE || state == STATE_FAST_DIVE) {
             angle.x = -PI * 0.5f;
             game->waterDrop(pos, 128.0f, 0.2f);
-            Sprite::add(game, TR::Entity::WATER_SPLASH, getRoomIndex(), (int)pos.x, (int)pos.y, (int)pos.z);
+            if (level->extra.waterSplash > -1)
+                game->addEntity(TR::Entity::WATER_SPLASH, getRoomIndex(), pos);
             return STATE_DIVE;
         }
 
@@ -1573,18 +2436,15 @@ struct Lara : Character {
 
         if (state == STATE_SURF_TREAD) {
             if (animation.isFrameActive(0))
-                game->waterDrop(animation.getJoints(getMatrix(), 14).pos, 96.0f, 0.03f);
+                game->waterDrop(animation.getJoints(getMatrix(), jointHead).pos, 96.0f, 0.03f);
         } else {
             if (animation.frameIndex % 4 == 0)
-                game->waterDrop(animation.getJoints(getMatrix(), 14).pos, 96.0f, 0.02f);
+                game->waterDrop(animation.getJoints(getMatrix(), jointHead).pos, 96.0f, 0.02f);
         }
 
         if (input & FORTH) {
-            if (input & JUMP) {
-                angle.x = -PI * 0.25f;
-                game->waterDrop(pos, 256.0f, 0.2f);
-                return animation.setAnim(ANIM_TO_UNDERWATER);
-            }
+            if (input & JUMP) 
+                return goUnderwater();
 
             if ((input & ACTION) && waterOut()) {
                 game->waterDrop(pos, 128.0f, 0.2f);
@@ -1604,7 +2464,7 @@ struct Lara : Character {
 
     virtual int getStateDeath() {
         velocity = vec3(0.0f);
-        return STATE_DEATH;
+        return (stand == STAND_UNDERWATER || stand == STAND_ONWATER) ? STATE_UNDERWATER_DEATH : (state == STATE_MIDAS_DEATH ? STATE_MIDAS_DEATH : STATE_DEATH);
     }
 
     virtual int getStateDefault() {
@@ -1620,35 +2480,68 @@ struct Lara : Character {
     }
 
     virtual int getInput() { // TODO: updateInput
-        if (level->cutEntity > -1) return 0;
+        if (level->isCutsceneLevel()) return 0;
+        input = 0;
+
+        if (!dozy && ((Input::state[cAction] && Input::state[cJump] && Input::state[cLook] && Input::state[cStepRight]) || Input::down[ikO])) {
+            dozy = true;
+            health = LARA_MAX_HEALTH;
+            oxygen = LARA_MAX_OXYGEN;
+            reset(getRoomIndex(), pos - vec3(0, 512, 0), angle.y, STAND_UNDERWATER);
+            return input;
+        }
+
+        if (dozy && Input::state[cWalk]) {
+            dozy = false;
+            return input;
+        }
+
         input = Character::getInput();
         if (input & DEATH) return input;
 
-        int &p = Input::joy.POV;
+        if (Input::state[cUp])        input |= FORTH;
+        if (Input::state[cRight])     input |= RIGHT;
+        if (Input::state[cDown])      input |= BACK;
+        if (Input::state[cLeft])      input |= LEFT;
+        if (Input::state[cRoll])      input  = FORTH | BACK;
+        if (Input::state[cStepRight]) input  = WALK  | RIGHT;
+        if (Input::state[cStepLeft])  input  = WALK  | LEFT;
+        if (Input::state[cJump])      input |= JUMP;
+        if (Input::state[cWalk])      input |= WALK;
+        if (Input::state[cAction])    input |= ACTION;
+        if (Input::state[cWeapon])    input |= WEAPON;
 
-    #ifndef LEVEL_EDITOR
-        if (Input::down[ikW]) input |= FORTH;
-        if (Input::down[ikD]) input |= RIGHT;
-        if (Input::down[ikS]) input |= BACK;
-        if (Input::down[ikA]) input |= LEFT;
-    #endif
-
-        if (Input::down[ikUp]    || p == 8 || p == 1 || p == 2)             input |= FORTH;
-        if (Input::down[ikRight] || p == 2 || p == 3 || p == 4)             input |= RIGHT;
-        if (Input::down[ikDown]  || p == 4 || p == 5 || p == 6)             input |= BACK;
-        if (Input::down[ikLeft]  || p == 6 || p == 7 || p == 8)             input |= LEFT;
-        if (Input::down[ikJoyB])                                            input  = FORTH | BACK; // roll
-        if (Input::down[ikJoyRT] || Input::down[ikX])                       input  = WALK | RIGHT; // step right
-        if (Input::down[ikJoyLT] || Input::down[ikZ])                       input  = WALK | LEFT;  // step left
-        if (Input::down[ikSpace] || Input::down[ikJoyX])                    input |= JUMP;
-        if (Input::down[ikShift] || Input::down[ikJoyLB])                   input |= WALK;
-        if (Input::down[ikE] || Input::down[ikCtrl] || Input::down[ikJoyA]) input |= ACTION;
-        if (Input::down[ikQ] || Input::down[ikAlt]  || Input::down[ikJoyY]) input |= WEAPON;
+    // scion debug (TODO: remove)
+        if (Input::down[ikP]) {
+            switch (level->id) {
+                case TR::LVL_TR1_3A :
+                    reset(51, vec3(41015, 3584, 34494), -PI);        // level 3a (t-rex)
+                    break;
+                case TR::LVL_TR1_3B :
+                    reset(5, vec3(73394, 3840, 60758), 0); // level 3b (scion)
+                    break;
+                case TR::LVL_TR1_4 :
+                    reset(18, vec3(34914, 11008, 41315), 90 * DEG2RAD); // main hall
+                    break;
+                case TR::LVL_TR1_6 :
+                    reset(73, vec3(73372, 122, 51687), PI * 0.5f);       // level 6 (midas hand)
+                    break;
+                case TR::LVL_TR1_7B :
+                    reset(77, vec3(36943, -4096, 62821), 270 * DEG2RAD); // level 7b (heavy trigger)
+                    break;
+                case TR::LVL_TR2_WALL :
+                    //reset(44, vec3(62976, 1536, 23040), 0);
+                    reset(44, vec3(62976, 1536, 23040), 0);
+                    break;
+                case TR::LVL_TR3_TEMPLE :
+                    reset(204, vec3(40562, 3584, 58694), 0);
+                    break;
+                default : game->playSound(TR::SND_NO, pos, Sound::PAN);
+            }
+        }
 
     // analog control
         rotFactor = vec2(1.0f);
-
-        if (Input::down[ikJoyL]) input = FORTH | BACK;
 
         if ((state == STATE_STOP || state == STATE_SURF_TREAD || state == STATE_HANG) && fabsf(Input::joy.L.x) < 0.5f && fabsf(Input::joy.L.y) < 0.5f)
             return input;
@@ -1680,21 +2573,71 @@ struct Lara : Character {
     virtual void doCustomCommand(int curFrame, int prevFrame) {
         switch (state) {
             case STATE_PICK_UP : {
-                TR::Entity &item = level->entities[lastPickUp];
-                if (!item.flags.invisible) {
-                    int pickupFrame = stand == STAND_GROUND ? PICKUP_FRAME_GROUND : PICKUP_FRAME_UNDERWATER;
-                    if (animation.isFrameActive(pickupFrame)) {
-                        item.flags.invisible = true;
-                        inventory.add(item.type, 1);
+                int pickupFrame = stand == STAND_GROUND ? PICKUP_FRAME_GROUND : PICKUP_FRAME_UNDERWATER;
+                if (animation.isFrameActive(pickupFrame)) {
+                    for (int i = 0; i < pickupListCount; i++) {
+                        if (pickupList[i]->getEntity().type == TR::Entity::SCION_PICKUP_HOLDER)
+                            continue;
+                        pickupList[i]->deactivate();
+                        pickupList[i]->flags.invisible = true;
+                        game->invAdd(pickupList[i]->getEntity().type, 1);
                     }
+                    pickupListCount = 0;
                 }
                 break;
             }
+            case STATE_USE_KEY    :                                  
             case STATE_USE_PUZZLE : {
-                TR::Entity &item = level->entities[lastPickUp];
-                if (animation.isFrameActive(PUZZLE_FRAME))
-                    ((Controller*)item.controller)->meshSwap(0, level->extra.puzzleSet);
+                if (keyHole && animation.isFrameActive(state == STATE_USE_PUZZLE ? PUZZLE_FRAME : KEY_FRAME)) {
+                    keyHole->activate();
+                    keyHole = NULL;
+                }
                 break;
+            }
+        }
+    }
+
+    virtual void update() {
+        if (level->isCutsceneLevel()) {
+            updateAnimation(true);
+
+            updateLights();
+
+            if (fixRoomIndex() && braid)
+                braid->update();
+        } else {
+            Character::update();
+            if (braid)
+                braid->update();
+        }
+        
+        if (level->isCutsceneLevel())
+            return;
+
+        if (damageTime > 0.0f)
+            damageTime = max(0.0f, damageTime - Core::deltaTime);
+
+        if (stand == STAND_UNDERWATER && !dozy) {
+            if (oxygen > 0.0f)
+                oxygen -= Core::deltaTime;
+            else
+                hit(Core::deltaTime * 150.0f);
+        } else
+            if (oxygen < LARA_MAX_OXYGEN)
+                oxygen = min(LARA_MAX_OXYGEN, oxygen += Core::deltaTime * 10.0f);
+
+        usedKey = TR::Entity::LARA;
+    }
+
+    void updateFlash() {
+        for (int i = 0; i < 2; i++) {
+            if (arms[i].shotTimer < MUZZLE_FLASH_TIME) {
+                arms[i].shotTimer += Core::deltaTime;
+                float intensity = clamp((0.1f - arms[i].shotTimer) * 20.0f, EPS, 1.0f);
+                Core::lightColor[1 + i] = FLASH_LIGHT_COLOR * vec4(intensity, intensity, intensity, 1.0f / sqrtf(intensity));
+                Core::lightPos[1 + i]   = animation.getJoints(getMatrix(), i == 0 ? 10 : 13, false).pos;
+            } else {
+                Core::lightColor[1 + i] = vec4(0, 0, 0, 1);
             }
         }
     }
@@ -1702,15 +2645,32 @@ struct Lara : Character {
     virtual void updateAnimation(bool commands) {
         Controller::updateAnimation(commands);
         updateWeapon();
+        updateFlash();
         if (stand == STAND_UNDERWATER)
             specular = 0.0f;
         else
             if (specular > 0.0f)
                 specular = max(0.0f, specular - LARA_WET_TIMER * Core::deltaTime);
+
+        if (state == STATE_MIDAS_DEATH || state == STATE_MIDAS_USE) {
+            uint32 sparklesMask = getMidasMask();
+
+            if (state == STATE_MIDAS_DEATH)
+                visibleMask = sparklesMask ^ 0xFFFFFFFF;
+
+            timer += Core::deltaTime;
+            if (timer >= 1.0f / 30.0f) {
+                timer -= 1.0f / 30.0f;
+                addSparks(sparklesMask);
+            }
+        }
     }
 
     virtual void updateVelocity() {
-        checkTrigger();
+        flowVelocity = vec3(0);
+
+        if (!(input & DEATH) && !level->isCutsceneLevel())
+            checkTrigger(this, false);
 
     // get turning angle
         float w = (input & LEFT) ? -1.0f : ((input & RIGHT) ? 1.0f : 0.0f);
@@ -1765,7 +2725,15 @@ struct Lara : Character {
 
         switch (stand) {
             case STAND_AIR :
-                velocity.y += GRAVITY * Core::deltaTime;
+                applyGravity(velocity.y);
+                if (velocity.y >= 154.0f && state == STATE_FALL)
+                    game->playSound(TR::SND_SCREAM, pos, Sound::PAN);
+                /*
+                if (state == STATE_FALL || state == STATE_FAST_DIVE) {
+                    velocity.x *= 0.95 * Core::deltaTime;
+                    velocity.z *= 0.95 * Core::deltaTime;
+                }
+                */
                 break;
             case STAND_GROUND  :
             case STAND_SLIDE   :
@@ -1788,15 +2756,14 @@ struct Lara : Character {
                     velocity.z = cosf(angleExt) * speed;
                     velocity.y = 0.0f;
                 } else {
-                    TR::Entity &e = getEntity();
                     TR::Level::FloorInfo info;
                     if (stand == STAND_HANG) {
                         vec3 p = pos + getDir() * (LARA_RADIUS + 2.0f);
-                        level->getFloorInfo(e.room, (int)p.x, (int)p.y, (int)p.z, info);
-                        if (info.roomAbove != TR::NO_ROOM && info.floor >= e.y - LARA_HANG_OFFSET)
-                            level->getFloorInfo(info.roomAbove, (int)p.x, (int)p.y, (int)p.z, info);
+                        getFloorInfo(getRoomIndex(), p, info);
+                        if (info.roomAbove != TR::NO_ROOM && info.floor >= pos.y - LARA_HANG_OFFSET)
+                            getFloorInfo(info.roomAbove, p, info);
                     } else
-                        level->getFloorInfo(e.room, e.x, e.y, e.z, info);
+                        getFloorInfo(getRoomIndex(), pos, info);
 
                     vec3 v(sinf(angleExt), 0.0f, cosf(angleExt));
                     velocity = info.getSlant(v) * speed;
@@ -1821,6 +2788,9 @@ struct Lara : Character {
     }
 
     virtual void updatePosition() { // TODO: sphere / bbox collision
+        if (level->isCutsceneLevel())
+            return;
+
         // tilt control
         vec2 vTilt(LARA_TILT_SPEED * Core::deltaTime, LARA_TILT_MAX);
         if (stand == STAND_UNDERWATER)
@@ -1828,53 +2798,100 @@ struct Lara : Character {
         vTilt *= rotFactor.y;
         updateTilt(state == STATE_RUN || stand == STAND_UNDERWATER, vTilt.x, vTilt.y);
 
-        if (velocity.length() >= 1.0f)
+        collisionOffset = vec3(0.0f);
+
+        if (checkCollisions() || (velocity + flowVelocity + collisionOffset).length2() >= 1.0f) // TODO: stop & smash anim
             move();
-
-        if (getEntity().type != TR::Entity::LARA) {
-            TR::Entity &e = getEntity();
-            vec3 &p = getPos();
-            e.x = int(p.x);
-            e.y = int(p.y);
-            e.z = int(p.z);
-            checkRoom();
-            updateEntity();
-        }
-
-        if (braid)
-            braid->update();
     }
 
-    virtual vec3& getPos() {
-        return getEntity().type == TR::Entity::LARA ? pos : chestOffset;
+    virtual vec3 getPos() {
+        return level->isCutsceneLevel() ? chestOffset : pos;
+    }
+
+    bool checkCollisions() {
+    // check static objects (TODO: check linked rooms?)
+        const TR::Room &room = getRoom();
+        Box box(pos - vec3(LARA_RADIUS, LARA_HEIGHT, LARA_RADIUS), pos + vec3(LARA_RADIUS, 0.0f, LARA_RADIUS));
+
+        for (int i = 0; i < room.meshesCount; i++) {
+            TR::Room::Mesh &m  = room.meshes[i];
+            TR::StaticMesh &sm = level->staticMeshes[m.meshIndex];
+            if (sm.flags != 2) continue;
+            Box meshBox;
+            sm.getBox(true, m.rotation, meshBox);
+            meshBox.translate(vec3(float(m.x), float(m.y), float(m.z)));
+            if (!box.intersect(meshBox)) continue;
+
+            collisionOffset += meshBox.pushOut2D(box);
+        }
+
+    // check enemies & doors
+        for (int i = 0; i < level->entitiesCount; i++) {
+            const TR::Entity &e = level->entities[i];
+
+            if (!e.controller || !e.isCollider()) continue;
+
+            Controller *controller = (Controller*)e.controller;
+
+            if (e.isEnemy()) {
+                if (e.type != TR::Entity::ENEMY_REX && (controller->flags.active != TR::ACTIVE || ((Character*)controller)->health <= 0)) continue;
+            } else {
+            // fast distance check for object
+                if (e.type != TR::Entity::HAMMER_HANDLE && e.type != TR::Entity::HAMMER_BLOCK && e.type != TR::Entity::SCION_HOLDER)
+                    if (fabsf(pos.x - controller->pos.x) > 1024 || fabsf(pos.z - controller->pos.z) > 1024 || fabsf(pos.y - controller->pos.y) > 2048) continue;
+            }
+
+            vec3 dir = pos - vec3(0.0f, 128.0f, 0.0f) - controller->pos;
+            vec3 p   = dir.rotateY(controller->angle.y);
+
+            Box box = controller->getBoundingBoxLocal();
+            box.expand(vec3(LARA_RADIUS + 50.0f, 0.0f, LARA_RADIUS + 50.0f));
+            box.max.y += 768;
+
+            if (!box.contains(p)) // TODO: Box vs Box or check Lara's head point? (check thor hammer handle)
+                continue;
+
+            if (e.isEnemy()) { // enemy collision
+                if (!collide(controller, false))
+                    continue;
+            //    velocity.x = velocity.y = 0.0f;
+            } else { // door collision
+                p += box.pushOut2D(p);
+                p = (p.rotateY(-controller->angle.y) + controller->pos) - pos;
+                collisionOffset += vec3(p.x, 0.0f, p.z);
+            }
+
+            if (e.type == TR::Entity::ENEMY_REX && ((Character*)controller)->health <= 0)
+                return true;
+            if (!e.isEnemy() || e.type == TR::Entity::ENEMY_BAT)
+                return true;
+
+            if (canHitAnim()) { // TODO: check enemy type and health here
+            // get hit dir
+                if (hitDir == -1) {
+                    if (health > 0)
+                        game->playSound(TR::SND_HIT, pos, Sound::PAN);
+                    hitTime = 0.0f;
+                }
+
+                hitDir = angleQuadrant(dir.rotateY(angle.y + PI * 0.5f).angleY());
+                return true;
+            }
+        };
+
+        if (lightning && lightning->flash && !lightning->armed) {
+            if (hitDir == -1)
+                hitTime = 0.0f;
+            hitDir = int(randf() * 4);
+        } else {
+            hitDir = -1;
+            lightning = NULL;
+        }
+        return false;
     }
 
     void move() {
-        //TR::Entity &e = getEntity();
-        //TR::Level::FloorInfo info;
-
-        //float f, c;
-        //bool canPassGap = true;
-        /*
-        if (velocity != 0.0f) {
-            vec3 dir = velocity.normal() * 128.0f;
-            vec3 p = pos + dir;
-            level->getFloorInfo(e.room, (int)p.x, (int)p.y, (int)p.z, info);
-            if (info.floor < p.y - (256 + 128)  || info.ceiling > p.y - 768) { // wall
-                vec3 axis   = dir.axisXZ();
-                vec3 normal = (p - vec3(int(p.x / 1024.0f) * 1024.0f + 512.0f, p.y, int(p.z / 1024.0f) * 1024.0f + 512.0f)).axisXZ();
-                LOG("%f %f = %f %f = %f\n", axis.x, axis.z, normal.x, normal.z, abs(axis.dot(normal)));
-                if (abs(axis.dot(normal)) > EPS) {
-                    canPassGap = false;
-                } else {
-                    updateEntity();
-                    checkRoom();
-                    return;
-                }
-            }
-        }
-        */
-        vec3 vel = velocity * Core::deltaTime * 30.0f;
+        vec3 vel = (velocity + flowVelocity) * Core::deltaTime * 30.0f + collisionOffset;
         vec3 opos(pos), offset(0.0f);
 
         float radius   = stand == STAND_UNDERWATER ? LARA_RADIUS_WATER : LARA_RADIUS;
@@ -1907,7 +2924,7 @@ struct Lara : Character {
             offset.y += LARA_HEIGHT_WATER * 0.5f;
         }
 
-        collision = Collision(level, room, pos, offset, vel, radius, angleExt, minHeight, maxHeight, maxAscent, maxDescent);
+        collision = Collision(this, room, pos, offset, vel, radius, angleExt, minHeight, maxHeight, maxAscent, maxDescent);
 
         if (!standHang && (collision.side == Collision::LEFT || collision.side == Collision::RIGHT)) {
             float rot = TURN_WALL_Y * Core::deltaTime;
@@ -1920,46 +2937,10 @@ struct Lara : Character {
             maxDescent = 0xFFFFFF;
             maxAscent  = -LARA_HANG_OFFSET;
             vec3 p = pos;
-            collision  = Collision(level, room, p, offset, vec3(0.0f), radius, angleExt, minHeight, maxHeight, maxAscent, maxDescent);
+            collision  = Collision(this, room, p, offset, vec3(0.0f), radius, angleExt, minHeight, maxHeight, maxAscent, maxDescent);
             if (collision.side == Collision::FRONT)
                 pos = opos;
         }
-
-        /*
-        TR::Animation *anim  = animation;
-        Box eBox = Box(pos - vec3(128.0f, 0.0f, 128.0f), pos + vec3(128.0, getHeight(), 128.0f)); // getBoundingBox();
-        // check static meshes in the room
-        if (canPassGap) {
-            TR::Room &r = level->rooms[e.room];
-            for (int i = 0; i < r.meshesCount; i++) {
-                TR::Room::Mesh &m = r.meshes[i];
-                TR::StaticMesh *sm = level->getMeshByID(m.meshID);
-                if (sm->flags != 2) continue; // no have collision box
-
-                Box  mBox;
-                vec3 offset(m.x, m.y, m.z);
-                sm->getBox(true, m.rotation, mBox);
-                mBox.min += offset;
-                mBox.max += offset;
-
-                if (eBox.intersect(mBox)) {
-                    canPassGap = false;
-                    break;
-                }
-            }
-        }
-
-        // check entities in the room
-        if (canPassGap)
-            for (int i = 0; i < level->entitiesCount; i++)
-                if (i != entity && level->entities[i].room == e.room && level->entities[i].controller) {
-                    Box mBox = ((Controller*)level->entities[i].controller)->getBoundingBox();
-                    if (eBox.intersect(mBox)) {
-                        canPassGap = false;
-                        break;
-                    }
-                }
-        */
 
     // get current leading foot in animation
         int rightStart = 0;
@@ -1980,12 +2961,22 @@ struct Lara : Character {
             velocity.y = 30.0f;
 
         if (collision.side == Collision::FRONT) {
-            int floor = collision.info[Collision::FRONT].floor;
+            float floor = collision.info[Collision::FRONT].floor;
+/*
+            switch (angleQuadrant(angleExt - angle.y)) {
+                case 0 : collision.side = Collision::FRONT; LOG("FRONT\n"); break;
+                case 1 : collision.side = Collision::RIGHT; LOG("RIGHT\n"); break;
+                case 2 : collision.side = Collision::BACK;  LOG("BACK\n");  break;
+                case 3 : collision.side = Collision::LEFT;  LOG("LEFT\n");  break;
+            }
+*/
+            if (velocity.dot(getDir()) <= EPS) 
+                collision.side = Collision::NONE;
 
         // hit the wall
             switch (stand) {
                 case STAND_AIR :
-                    if (state == STATE_UP_JUMP || state == STATE_REACH)
+                    if (state == STATE_UP_JUMP || state == STATE_REACH || state == STATE_FALL_BACK)
                         velocity.x = velocity.z = 0.0f;
 
                     if (velocity.x != 0.0f || velocity.z != 0.0f) {
@@ -2016,13 +3007,10 @@ struct Lara : Character {
             }
         } else {
             if (stand == STAND_GROUND) {
-                int floor = collision.info[Collision::NONE].floor;
-                int h = int(floor - opos.y);
+                float floor = collision.info[Collision::NONE].floor;
+                float h = floor - opos.y;
 
-                if (h >= 256 && state == STATE_FAST_BACK) {
-                    stand = STAND_AIR;
-                    animation.setAnim(ANIM_FALL);
-                } else if (h >= 128 && (state == STATE_WALK || state == STATE_BACK)) { // descend
+                if (h >= 128 && (state == STATE_WALK || state == STATE_BACK)) { // descend
                     if (state == STATE_WALK) animation.setAnim(isLeftFoot ? ANIM_WALK_DESCEND_LEFT : ANIM_WALK_DESCEND_RIGHT);
                     if (state == STATE_BACK) animation.setAnim(isLeftFoot ? ANIM_BACK_DESCEND_LEFT : ANIM_BACK_DESCEND_RIGHT);
                     pos.y = float(floor);
@@ -2040,18 +3028,71 @@ struct Lara : Character {
             collision.side = Collision::NONE;
         }
 
-        updateEntity();
+        if (dozy) stand = STAND_GROUND;
         checkRoom();
+        if (dozy) stand = STAND_UNDERWATER;
     }
 
     virtual void applyFlow(TR::Camera &sink) {
         if (stand != STAND_UNDERWATER && stand != STAND_ONWATER) return;
-        vec3 v(0.0f);
-        v.x = (float)sign((sink.x / 1024 - (int)pos.x / 1024));
-        v.z = (float)sign((sink.z / 1024 - (int)pos.z / 1024));
-        velocity = v * (sink.speed * 8.0f);
+
+        vec3 target = vec3(float(sink.x), float(sink.y), float(sink.z));
+
+    #ifdef _DEBUG
+        //delete[] dbgBoxes;
+        //dbgBoxes = NULL;
+    #endif
+
+        if (box != sink.flags.boxIndex) {
+            uint16 *boxes;
+            uint16 count = game->findPath(0xFFFFFF, -0xFFFFFF, false, box, sink.flags.boxIndex, getZones(), &boxes);
+            if (count > 1) {
+            #ifdef _DEBUG
+                //dbgBoxesCount = count;
+                //dbgBoxes = new uint16[dbgBoxesCount];
+                //memcpy(dbgBoxes, boxes, sizeof(uint16) * dbgBoxesCount);
+            #endif
+                TR::Box &b = level->boxes[boxes[1]];
+                target.x = (b.minX + b.maxX) * 0.5f;
+                if (target.y > b.floor)
+                    target.y = float(b.floor);
+                target.z = (b.minZ + b.maxZ) * 0.5f;
+            }
+        }
+
+        flowVelocity = vec3(0);
+        if (!dozy) {
+            float speed = sink.speed * 6.0f;
+            flowVelocity.x = clamp(target.x - pos.x, -speed, +speed);
+            flowVelocity.y = clamp(target.y - pos.y, -speed, +speed);
+            flowVelocity.z = clamp(target.z - pos.z, -speed, +speed);
+
+            if (stand == STAND_ONWATER)
+                goUnderwater();
+        }
     }
 
+    uint32 getMidasMask() {
+        if (state == STATE_MIDAS_USE)
+            return BODY_ARM_L3 | BODY_ARM_R3;
+
+        uint32 mask = 0;
+        int frame = animation.frameIndex;
+        if (frame > 4  ) mask |= BODY_LEG_L3 | BODY_LEG_R3;
+        if (frame > 69 ) mask |= BODY_LEG_L2;
+        if (frame > 79 ) mask |= BODY_LEG_L1;
+        if (frame > 99 ) mask |= BODY_LEG_R2;
+        if (frame > 119) mask |= BODY_LEG_R1 | BODY_HIP;
+        if (frame > 134) mask |= BODY_CHEST;
+        if (frame > 149) mask |= BODY_ARM_L1;
+        if (frame > 162) mask |= BODY_ARM_L2;
+        if (frame > 173) mask |= BODY_ARM_L3;
+        if (frame > 185) mask |= BODY_ARM_R1;
+        if (frame > 194) mask |= BODY_ARM_R2;
+        if (frame > 217) mask |= BODY_ARM_R3;
+        if (frame > 224) mask |= BODY_HEAD;
+        return mask;
+    }
 
     void renderMuzzleFlash(MeshBuilder *mesh, const Basis &basis, const vec3 &offset, float time) {
         ASSERT(level->extra.muzzleFlash);
@@ -2061,14 +3102,21 @@ struct Lara : Character {
         Basis b(basis);
         b.rotate(quat(vec3(1, 0, 0), -PI * 0.5f));
         b.translate(offset);
+        if (level->version & (TR::VER_TR2 | TR::VER_TR3))
+            lum = alpha;
         Core::active.shader->setParam(uMaterial, vec4(lum, 0.0f, 0.0f, alpha));
         Core::active.shader->setParam(uBasis, b);
         mesh->renderModel(level->extra.muzzleFlash);
     }
 
-    virtual void render(Frustum *frustum, MeshBuilder *mesh, Shader::Type type, bool caustics) {
+    virtual void render(Frustum *frustum, MeshBuilder *mesh, Shader::Type type, bool caustics) { // TODO TR3 render in additive pass
+        uint32 visMask = visibleMask;
+        if (Core::pass != Core::passShadow && game->getCamera()->firstPerson) // hide head from first person view
+            visibleMask &= ~BODY_HEAD;
         Controller::render(frustum, mesh, type, caustics);
-        chestOffset = animation.getJoints(getMatrix(), 7).pos; // TODO: move to update func
+        visibleMask = visMask;
+
+        chestOffset = animation.getJoints(getMatrix(), jointChest).pos; // TODO: move to update func
 
         if (braid)
             braid->render(mesh);
@@ -2076,9 +3124,41 @@ struct Lara : Character {
         if (wpnCurrent != Weapon::SHOTGUN && Core::pass != Core::passShadow && (arms[0].shotTimer < MUZZLE_FLASH_TIME || arms[1].shotTimer < MUZZLE_FLASH_TIME)) {
             mat4 matrix = getMatrix();
             game->setShader(Core::pass, Shader::FLASH, false, true);
+            
+            int meshTransp = mesh->transparent;
+            float zOffset;
+            if (level->version & (TR::VER_TR2 | TR::VER_TR3)) {
+                mesh->transparent = 2;
+                Core::setBlending(bmAdd);
+                zOffset = 180;
+            } else {
+                Core::setBlending(bmAlpha);
+                zOffset = 150;
+            }
+
+            renderMuzzleFlash(mesh, animation.getJoints(matrix, 10, true), vec3(-10, -50, zOffset), arms[0].shotTimer);
+            renderMuzzleFlash(mesh, animation.getJoints(matrix, 13, true), vec3( 10, -50, zOffset), arms[1].shotTimer);
+
+            mesh->transparent = meshTransp;
+            switch (mesh->transparent) {
+                case 0 : Core::setBlending(bmNone);  break;
+                case 1 : Core::setBlending(bmAlpha); break;
+                case 2 : Core::setBlending(bmAdd);   break;
+            }
+        }
+
+        if (state == STATE_MIDAS_DEATH /* && Core::pass == Core::passCompose */) {
+            game->setRoomParams(getRoomIndex(), Shader::MIRROR, 1.2f, 1.0f, 0.2f, 1.0f, false);
+        /* catsuit test
+            game->setRoomParams(getRoomIndex(), Shader::MIRROR, 0.3f, 0.3f, 0.3f, 1.0f, false);
+            Core::active.shader->setParam(uLightColor, Core::lightColor[0], MAX_LIGHTS);
+            Core::active.shader->setParam(uLightPos,   Core::lightPos[0],   MAX_LIGHTS);
+        */
+            environment->bind(sEnvironment);
             Core::setBlending(bmAlpha);
-            renderMuzzleFlash(mesh, animation.getJoints(matrix, 10, true), vec3(-10, -50, 150), arms[0].shotTimer);
-            renderMuzzleFlash(mesh, animation.getJoints(matrix, 13, true), vec3( 10, -50, 150), arms[1].shotTimer);
+            visibleMask ^= 0xFFFFFFFF;
+            Controller::render(frustum, mesh, type, caustics);
+            visibleMask ^= 0xFFFFFFFF;
             Core::setBlending(bmNone);
         }
     }

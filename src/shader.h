@@ -5,9 +5,11 @@
 
 #define SHADER_ATTRIBS(E) \
     E( aCoord           ) \
-    E( aTexCoord        ) \
     E( aNormal          ) \
-    E( aColor           )
+    E( aTexCoord        ) \
+    E( aParam           ) \
+    E( aColor           ) \
+    E( aLight           )
 
 #define SHADER_SAMPLERS(E) \
     E( sDiffuse         ) \
@@ -21,7 +23,6 @@
     E( uParam           ) \
     E( uTexParam        ) \
     E( uViewProj        ) \
-    E( uViewInv         ) \
     E( uBasis           ) \
     E( uLightProj       ) \
     E( uMaterial        ) \
@@ -32,18 +33,16 @@
     E( uAnimTexRanges   ) \
     E( uAnimTexOffsets  ) \
     E( uRoomSize        ) \
-    E( uPosScale        )
+    E( uPosScale        ) \
+    E( uContacts        )
 
-#define ENUM(v) v,
-#define STR(v)  #v,
+enum AttribType  { SHADER_ATTRIBS(DECL_ENUM)  aMAX };
+enum SamplerType { SHADER_SAMPLERS(DECL_ENUM) sMAX };
+enum UniformType { SHADER_UNIFORMS(DECL_ENUM) uMAX };
 
-enum AttribType  { SHADER_ATTRIBS(ENUM)  aMAX };
-enum SamplerType { SHADER_SAMPLERS(ENUM) sMAX };
-enum UniformType { SHADER_UNIFORMS(ENUM) uMAX };
-
-const char *AttribName[aMAX]  = { SHADER_ATTRIBS(STR)  };
-const char *SamplerName[sMAX] = { SHADER_SAMPLERS(STR) };
-const char *UniformName[uMAX] = { SHADER_UNIFORMS(STR) };
+const char *AttribName[aMAX]  = { SHADER_ATTRIBS(DECL_STR)  };
+const char *SamplerName[sMAX] = { SHADER_SAMPLERS(DECL_STR) };
+const char *UniformName[uMAX] = { SHADER_UNIFORMS(DECL_STR) };
 
 #undef SHADER_ATTRIBS
 #undef SHADER_SAMPLERS
@@ -59,9 +58,9 @@ struct Shader {
     enum Type : GLint { 
         DEFAULT = 0,
         /* shader */ SPRITE = 0, FLASH = 1, ROOM = 2, ENTITY = 3, MIRROR = 4, 
-        /* filter */ FILTER_DOWNSAMPLE = 1, 
+        /* filter */ FILTER_DOWNSAMPLE = 1, FILTER_GRAYSCALE = 2, FILTER_BLUR = 3, FILTER_MIXER = 4, FILTER_EQUIRECTANGULAR = 5,
         /* water  */ WATER_DROP = 0, WATER_STEP = 1, WATER_CAUSTICS = 2, WATER_MASK = 3, WATER_COMPOSE = 4,
-        MAX = 5
+        MAX = 6
     };
 
     Shader(const char *source, const char *defines = "") {
@@ -134,7 +133,7 @@ struct Shader {
     }
     
     bool linkBinary(const char *fileName) {
-        if (!Stream::fileExists(fileName))
+        if (!Stream::exists(fileName))
             return false;
 
         GLenum size, format;
@@ -161,8 +160,11 @@ struct Shader {
 
     void init() {
         bind();
-        for (int st = 0; st < sMAX; st++)
-            glUniform1iv(glGetUniformLocation(ID, (GLchar*)SamplerName[st]), 1, &st);
+        for (int st = 0; st < sMAX; st++) {
+            GLint idx = glGetUniformLocation(ID, (GLchar*)SamplerName[st]);
+            if (idx != -1)
+                glUniform1iv(idx, 1, &st);
+        }
 
         for (int ut = 0; ut < uMAX; ut++)
             uID[ut] = glGetUniformLocation(ID, (GLchar*)UniformName[ut]);

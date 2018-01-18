@@ -16,6 +16,7 @@ import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
+import android.os.Environment;
 import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
@@ -65,10 +66,10 @@ public class MainActivity extends Activity implements OnTouchListener, OnKeyList
         try {
             String packName = getPackageManager().getPackageInfo(getPackageName(), PackageManager.GET_ACTIVITIES).applicationInfo.sourceDir;
             // hardcoded demo level and music
-            AssetFileDescriptor fLevel = this.getResources().openRawResourceFd(R.raw.level2);
-            AssetFileDescriptor fMusic = this.getResources().openRawResourceFd(R.raw.music);
+            //AssetFileDescriptor fLevel = this.getResources().openRawResourceFd(R.raw.title);
 
-            wrapper.onCreate(packName, getCacheDir().getAbsolutePath() + "/", (int)fLevel.getStartOffset(), (int)fMusic.getStartOffset());
+            String content = Environment.getExternalStorageDirectory().getAbsolutePath(); // System.getenv("EXTERNAL_STORAGE")
+            wrapper.onCreate(content + "/OpenLara/", getCacheDir().getAbsolutePath() + "/", packName, 0);//(int)fLevel.getStartOffset());
         } catch (Exception e) {
             e.printStackTrace();
             finish();
@@ -169,7 +170,10 @@ public class MainActivity extends Activity implements OnTouchListener, OnKeyList
             case KeyEvent.KEYCODE_BUTTON_THUMBR : btn = -9;  break;
             case KeyEvent.KEYCODE_BUTTON_L2     : btn = -10; break;
             case KeyEvent.KEYCODE_BUTTON_R2     : btn = -11; break;
-            case KeyEvent.KEYCODE_BACK          : btn = KeyEvent.KEYCODE_ESCAPE; break;
+            case KeyEvent.KEYCODE_BACK          : btn = KeyEvent.KEYCODE_TAB; break;
+            case KeyEvent.KEYCODE_VOLUME_UP     :
+            case KeyEvent.KEYCODE_VOLUME_DOWN   :
+            case KeyEvent.KEYCODE_VOLUME_MUTE   : return false;
             default                             : btn = keyCode;
         }
 
@@ -194,18 +198,30 @@ class Sound {
         int rate = 44100;
         int size = AudioTrack.getMinBufferSize(rate, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT);
         //System.out.println(String.format("sound buffer size: %d", bufSize));
-        buffer = new short [size / 2];
-        audioTrack = new AudioTrack(AudioManager.STREAM_MUSIC, 44100, AudioFormat.CHANNEL_OUT_STEREO,
-                                    AudioFormat.ENCODING_PCM_16BIT, size, AudioTrack.MODE_STREAM);
-        audioTrack.play();
+        buffer = new short[size / 2];
+
+        try {
+            audioTrack = new AudioTrack(AudioManager.STREAM_MUSIC, 44100, AudioFormat.CHANNEL_OUT_STEREO,
+                    AudioFormat.ENCODING_PCM_16BIT, size, AudioTrack.MODE_STREAM);
+        }catch (IllegalArgumentException e){
+            System.out.println("Error: buffer size is zero");
+            return;
+        }
+
+        try {
+            audioTrack.play();
+        }catch (NullPointerException e){
+            System.out.println("Error: audioTrack null pointer on start()");
+            return;
+        }
 
         new Thread( new Runnable() {
             public void run() {
                 while ( audioTrack.getPlayState() != AudioTrack.PLAYSTATE_STOPPED ) {
                     if (audioTrack.getPlayState() == AudioTrack.PLAYSTATE_PLAYING && wrapper.ready) {
-                        synchronized (wrapper) {
+                        //synchronized (wrapper) {
                             Wrapper.nativeSoundFill(buffer);
-                        }
+                        //}
                         audioTrack.write(buffer, 0, buffer.length);
                         audioTrack.flush();
                     } else
@@ -220,17 +236,29 @@ class Sound {
     }
 
     void stop() {
-        audioTrack.flush();
-        audioTrack.stop();
-        audioTrack.release();
+        try {
+            audioTrack.flush();
+            audioTrack.stop();
+            audioTrack.release();
+        }catch (NullPointerException e){
+            System.out.println("Error: audioTrack null pointer on stop()");
+        }
     }
 
     void play() {
-        audioTrack.play();
+        try {
+            audioTrack.play();
+        }catch (NullPointerException e){
+            System.out.println("Error: audioTrack null pointer on play()");
+        }
     }
 
     void pause() {
-        audioTrack.pause();
+        try {
+            audioTrack.pause();
+        }catch (NullPointerException e){
+            System.out.println("Error: audioTrack null pointer on pause()");
+        };
     }
 }
 
@@ -246,7 +274,7 @@ class Touch {
 }
 
 class Wrapper implements Renderer {
-    public static native void nativeInit(String packName, String cacheDir, int levelOffset, int musicOffset);
+    public static native void nativeInit(String contentDir, String cacheDir, String packName, int levelOffset);
     public static native void nativeFree();
     public static native void nativeReset();
     public static native void nativeResize(int w, int h);
@@ -256,18 +284,18 @@ class Wrapper implements Renderer {
     public static native void nativeSoundFill(short buffer[]);
 
     Boolean ready = false;
-    private String packName;
+    private String contentDir;
     private String cacheDir;
+    private String packName;
     private int levelOffset;
-    private int musicOffset;
     private ArrayList<Touch> touch = new ArrayList<>();
     private Sound sound;
 
-    void onCreate(String packName, String cacheDir, int levelOffset, int musicOffset) {
-        this.packName = packName;
-        this.cacheDir = cacheDir;
+    void onCreate(String contentDir, String cacheDir, String packName, int levelOffset) {
+        this.contentDir  = contentDir;
+        this.cacheDir    = cacheDir;
+        this.packName    = packName;
         this.levelOffset = levelOffset;
-        this.musicOffset = musicOffset;
 
         sound = new Sound();
         sound.start(this);
@@ -301,8 +329,8 @@ class Wrapper implements Renderer {
                 nativeTouch(t.id, t.state, t.x, t.y);
             }
             touch.clear();
-            nativeUpdate();
         }
+        nativeUpdate();
         nativeRender();
     }
 
@@ -314,7 +342,7 @@ class Wrapper implements Renderer {
     @Override
     public void onSurfaceCreated(GL10 gl, EGLConfig config) {
         if (!ready) {
-            nativeInit(packName, cacheDir, levelOffset, musicOffset);
+            nativeInit(contentDir, cacheDir, packName, levelOffset);
             sound.play();
             ready = true;
         }

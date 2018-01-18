@@ -2,11 +2,10 @@
 #define H_CHARACTER
 
 #include "controller.h"
-#include "trigger.h"
+#include "collision.h"
 
 struct Character : Controller {
-    int     target;
-    int     health;
+    float   health;
     float   tilt;
     quat    rotHead, rotChest;
 
@@ -27,15 +26,69 @@ struct Character : Controller {
         DEATH       = 1 << 9
     };
 
+    Controller  *viewTarget;
+    int         jointChest;
+    int         jointHead;
+    vec4        rangeChest;
+    vec4        rangeHead;
+
     vec3    velocity;
     float   angleExt;
     float   speed;
+    int     stepHeight;
+    int     dropHeight;
+
+    int     zone;
+    int     box;
+
+    bool    flying;
 
     Collision collision;
 
-    Character(IGame *game, int entity, int health) : Controller(game, entity), target(-1), health(health), tilt(0.0f), stand(STAND_GROUND), lastInput(0), velocity(0.0f), angleExt(0.0f) {
+    Character(IGame *game, int entity, float health) : Controller(game, entity), health(health), tilt(0.0f), stand(STAND_GROUND), lastInput(0), viewTarget(NULL), jointChest(-1), jointHead(-1), velocity(0.0f), angleExt(0.0f), speed(0.0f) {
+        stepHeight =  256;
+        dropHeight = -256;
+
+        rangeChest = vec4(-0.80f, 0.80f, -0.75f, 0.75f) * PI;
+        rangeHead  = vec4(-0.25f, 0.25f, -0.50f, 0.50f) * PI;
         animation.initOverrides();
+
         rotHead  = rotChest = quat(0, 0, 0, 1);
+
+        flying = getEntity().type == TR::Entity::ENEMY_BAT;
+        updateZone();
+    }
+
+    virtual int getRoomIndex() const {
+        int index = Controller::getRoomIndex();
+        
+        if (level->isCutsceneLevel())
+            return index;
+        
+        TR::Level::FloorInfo info;
+        getFloorInfo(index, pos, info);
+
+        if (level->rooms[index].flags.water && info.roomAbove != TR::NO_ROOM && (info.floor - level->rooms[index].info.yTop) <= 512)
+            return info.roomAbove;
+        return index;
+    }
+
+    bool updateZone() {
+        if (level->isCutsceneLevel())
+            return false;
+
+        int dx, dz;
+        TR::Room::Sector &s = level->getSector(getRoomIndex(), int(pos.x), int(pos.z), dx, dz);
+        if (s.boxIndex == 0xFFFF)
+            return false;
+        box  = s.boxIndex;
+        zone = getZones()[box];
+        return true;
+    }
+
+    uint16* getZones() {
+        TR::Zone &zones = level->zones[level->state.flags.flipped];
+        return (flying || stand == STAND_UNDERWATER || stand == STAND_ONWATER) ? zones.fly : (stepHeight == 256 ? zones.ground1 : zones.ground2);
     }
 
     void rotateY(float delta) {
@@ -47,35 +100,33 @@ struct Character : Controller {
         angle.x = clamp(angle.x + delta, -PI * 0.49f, PI * 0.49f);
     }
 
-    virtual void hit(int damage, Controller *enemy = NULL) {
-        health -= damage;
-    };
+    virtual void hit(float damage, Controller *enemy = NULL, TR::HitType hitType = TR::HIT_DEFAULT) {
+        health = max(0.0f, health - damage);
+    }
 
     virtual void checkRoom() {
         TR::Level::FloorInfo info;
-        TR::Entity &e = getEntity();
-        level->getFloorInfo(e.room, e.x, e.y, e.z, info);
+        getFloorInfo(getRoomIndex(), pos, info);
 
         if (info.roomNext != TR::NO_ROOM)
-            e.room = info.roomNext;        
+            roomIndex = info.roomNext;        
 
-        if (info.roomBelow != TR::NO_ROOM && e.y > info.roomFloor)
-            e.room = info.roomBelow;
+        if (info.roomBelow != TR::NO_ROOM && pos.y > info.roomFloor)
+            roomIndex = info.roomBelow;
 
-        if (info.roomAbove != TR::NO_ROOM && e.y <= info.roomCeiling) {
-            if (stand == STAND_UNDERWATER && !level->rooms[info.roomAbove].flags.water) {
+        if (info.roomAbove != TR::NO_ROOM && pos.y <= info.roomCeiling) {
+            TR::Room *room = &level->rooms[info.roomAbove];
+            if (level->state.flags.flipped && room->alternateRoom > -1)
+                room = &level->rooms[room->alternateRoom];
+
+            if (stand == STAND_UNDERWATER && !room->flags.water) {
                 stand = STAND_ONWATER;
                 velocity.y = 0;
-                pos.y = float(info.roomCeiling);
-                updateEntity();
+                pos.y = info.roomCeiling;
             } else
                 if (stand != STAND_ONWATER)
-                    e.room = info.roomAbove;
+                    roomIndex = info.roomAbove;
         }
-    }
-
-    virtual void cmdKill() {
-        health = 0;
     }
 
     virtual void  updateVelocity()      {}
@@ -115,6 +166,11 @@ struct Character : Controller {
             animation.setState(getStateDefault());
     }
 
+    virtual void updateTilt(float value, float tiltSpeed, float tiltMax) {
+        value = clamp(value, -tiltMax, +tiltMax);
+        decrease(value - angle.z, angle.z, tiltSpeed);
+    }
+
     virtual void updateTilt(bool active, float tiltSpeed, float tiltMax) {
     // calculate turning tilt
         if (active && (input & (LEFT | RIGHT)) && (tilt == 0.0f || (tilt < 0.0f && (input & LEFT)) || (tilt > 0.0f && (input & RIGHT)))) {
@@ -139,10 +195,17 @@ struct Character : Controller {
         stand = getStand();
         updateState();
         Controller::update();
-        updateVelocity();
-        updatePosition();
-        if (p != pos)
-            updateLights();
+
+        if (flags.active) {
+            updateVelocity();
+            updatePosition();
+            if (p != pos) {
+                if (updateZone())
+                    updateLights();
+                else
+                    pos = p;
+            }
+        }
     }
 
     virtual void cmdJump(const vec3 &vel) {
@@ -152,15 +215,31 @@ struct Character : Controller {
         stand = STAND_AIR;
     }
 
-    virtual void doBubbles() {
-        int count = rand() % 3;
-        if (!count) return;
-        playSound(TR::SND_BUBBLE, pos, Sound::Flags::PAN);
-        vec3 head = animation.getJoints(getMatrix(), 14, true) * vec3(0.0f, 0.0f, 50.0f);
-        for (int i = 0; i < count; i++) {
-            int index = Sprite::add(game, TR::Entity::BUBBLE, getRoomIndex(), int(head.x), int(head.y), int(head.z), Sprite::FRAME_RANDOM, true);
-            if (index > -1)
-                level->entities[index].controller = new Bubble(game, index);
+    vec3 getViewPoint() {
+        return animation.getJoints(getMatrix(), jointChest).pos;
+    }
+
+    virtual void lookAt(Controller *target) {
+        if (health <= 0.0f)
+            target = NULL;
+
+        float speed = 8.0f * Core::deltaTime;
+        quat rot;
+
+        if (jointChest > -1) {
+            if (aim(target, jointChest, rangeChest, rot))
+                rotChest = rotChest.slerp(quat(0, 0, 0, 1).slerp(rot, 0.5f), speed);
+            else 
+                rotChest = rotChest.slerp(quat(0, 0, 0, 1), speed);
+            animation.overrides[jointChest] = rotChest * animation.overrides[jointChest];
+        }
+
+        if (jointHead > -1) {
+            if (aim(target, jointHead, rangeHead, rot))
+                rotHead = rotHead.slerp(rot, speed);
+            else
+                rotHead = rotHead.slerp(quat(0, 0, 0, 1), speed);
+            animation.overrides[jointHead] = rotHead * animation.overrides[jointHead];
         }
     }
 };

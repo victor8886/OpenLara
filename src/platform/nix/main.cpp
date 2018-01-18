@@ -11,6 +11,24 @@
 
 #define WND_TITLE       "OpenLara"
 
+// Time
+unsigned int startTime;
+
+int osGetTime() {
+    timeval t;
+    gettimeofday(&t, NULL);
+    return int((t.tv_sec - startTime) * 1000 + t.tv_usec / 1000);
+}
+
+bool osSave(const char *name, const void *data, int size) {
+    FILE *f = fopen(name, "wb");
+    if (!f) return false;
+    fwrite(data, size, 1, f);
+    fclose(f);
+    return true;
+}
+
+// Sound
 #define SND_FRAME_SIZE  4
 #define SND_DATA_SIZE   (1024 * SND_FRAME_SIZE)
 
@@ -38,7 +56,7 @@ void sndInit() {
     };
 
     static const pa_buffer_attr attr = {
-        .maxlength  = SND_DATA_SIZE * 2,
+        .maxlength  = SND_DATA_SIZE * 4,
         .tlength    = 0xFFFFFFFF,
         .prebuf     = 0xFFFFFFFF,
         .minreq     = SND_DATA_SIZE,
@@ -70,15 +88,10 @@ void sndFree() {
     pthread_mutex_destroy(&sndMutex);
 }
 
-int getTime() {
-    timeval t;
-    gettimeofday(&t, NULL);
-    return (t.tv_sec * 1000 + t.tv_usec / 1000);
-}
-
+// Input
 InputKey keyToInputKey(int code) {
     int codes[] = {
-        113, 114, 111, 116, 65, 36, 9, 50, 37, 64,
+        113, 114, 111, 116, 65, 23, 36, 9, 50, 37, 64,
         19, 10, 11, 12, 13, 14, 15, 16, 17, 18,
         38, 56, 54, 40, 26, 41, 42, 43, 31, 44, 45, 46, 58,
         57, 32, 33, 24, 27, 39, 28, 30, 55, 25, 53, 29, 52,
@@ -99,7 +112,25 @@ InputKey mouseToInputKey(int btn) {
     return ikNone;
 }
 
-void WndProc(const XEvent &e) {
+void toggle_fullscreen(Display* dpy, Window win) {
+    const size_t _NET_WM_STATE_TOGGLE=2;
+
+    XEvent xev;
+    Atom wm_state  =  XInternAtom(dpy, "_NET_WM_STATE", False);
+    Atom scr_full  =  XInternAtom(dpy, "_NET_WM_STATE_FULLSCREEN", False);
+
+    memset(&xev, 0, sizeof(xev));
+    xev.type = ClientMessage;
+    xev.xclient.window = win;
+    xev.xclient.message_type = wm_state;
+    xev.xclient.format = 32;
+    xev.xclient.data.l[0] = _NET_WM_STATE_TOGGLE;
+    xev.xclient.data.l[1] = scr_full;
+
+    XSendEvent(dpy, DefaultRootWindow(dpy), False, SubstructureNotifyMask, &xev);
+}
+
+void WndProc(const XEvent &e,Display*dpy,Window wnd) {
     switch (e.type) {
         case ConfigureNotify :
             Core::width  = e.xconfigure.width;
@@ -108,7 +139,7 @@ void WndProc(const XEvent &e) {
         case KeyPress   :
         case KeyRelease :
             if (e.type == KeyPress && (e.xkey.state & Mod1Mask) && e.xkey.keycode == 36) {
-                // TODO: windowed <-> fullscreen switch
+                toggle_fullscreen(dpy,wnd);
                 break;
             }
             Input::setDown(keyToInputKey(e.xkey.keycode), e.type == KeyPress);
@@ -129,7 +160,7 @@ void WndProc(const XEvent &e) {
 char Stream::cacheDir[255];
 char Stream::contentDir[255];
 
-int main() {
+int main(int argc, char **argv) {
     Stream::contentDir[0] = Stream::cacheDir[0] = 0;
 
     const char *home;
@@ -146,6 +177,10 @@ int main() {
         GLX_RGBA,
         GLX_DOUBLEBUFFER,
         GLX_DEPTH_SIZE, 24,
+        GLX_RED_SIZE, 8,
+        GLX_GREEN_SIZE, 8,
+        GLX_BLUE_SIZE, 8,
+        GLX_ALPHA_SIZE, 8,
         0
     };
 
@@ -172,35 +207,33 @@ int main() {
     Atom WM_DELETE_WINDOW = XInternAtom(dpy, "WM_DELETE_WINDOW", 0);
     XSetWMProtocols(dpy, wnd, &WM_DELETE_WINDOW, 1);
 
+    timeval t;
+    gettimeofday(&t, NULL);
+    startTime = t.tv_sec;
+
     sndInit();
-    Game::init();
+    Game::init(argc > 1 ? argv[1] : NULL);
 
-    int lastTime = getTime();
-
-    while (1) {
+    while (!Core::isQuit) {
         if (XPending(dpy)) {
             XEvent event;
             XNextEvent(dpy, &event);
             if (event.type == ClientMessage && *event.xclient.data.l == WM_DELETE_WINDOW)
-                break;
-            WndProc(event);
+                Core::quit();
+            WndProc(event,dpy,wnd);
         } else {
-            int time = getTime();
-            if (time <= lastTime)
-                continue;
-
             pthread_mutex_lock(&sndMutex);
-            Game::update((time - lastTime) * 0.001f);
+			bool updated = Game::update();
             pthread_mutex_unlock(&sndMutex);
-            lastTime = time;
-
-            Game::render();
-            glXSwapBuffers(dpy, wnd);
+            if (updated) {
+				Game::render();
+				glXSwapBuffers(dpy, wnd);
+			}
         }
     };
 
     sndFree();
-    Game::free();
+    Game::deinit();
 
     glXMakeCurrent(dpy, 0, 0);
     XCloseDisplay(dpy);

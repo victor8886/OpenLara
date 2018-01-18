@@ -7,8 +7,13 @@
 #include <float.h>
 
 #ifdef _DEBUG
-    #define debugBreak() _asm { int 3 }
-    #define ASSERT(expr) if (expr) {} else { LOG("ASSERT %s in %s:%d\n", #expr, __FILE__, __LINE__); debugBreak(); }
+    #ifdef LINUX
+        #define debugBreak() raise(SIGTRAP);
+    #else
+        #define debugBreak() _asm { int 3 }
+    #endif
+
+    #define ASSERT(expr) if (expr) {} else { LOG("ASSERT:\n  %s:%d\n  %s => %s\n", __FILE__, __LINE__, __FUNCTION__, #expr); debugBreak(); }
 
     #ifndef ANDROID
         #define LOG(...) printf(__VA_ARGS__)
@@ -16,11 +21,12 @@
 
 #else
     #define ASSERT(expr)
-//    #ifdef PROFILE
+    #ifdef LINUX
+        #define LOG(...) printf(__VA_ARGS__); fflush(stdout)
+    #else
         #define LOG(...) printf(__VA_ARGS__)
-//    #else
-//        #define LOG(...) 0
-//    #endif
+    //    #define LOG(...) 0
+    #endif
 #endif
 
 #ifdef ANDROID
@@ -29,6 +35,11 @@
         #define LOG(...) __android_log_print(ANDROID_LOG_INFO,"OpenLara",__VA_ARGS__)
 #endif
 
+extern int osGetTime();
+extern bool osSave(const char *name, const void *data, int size);
+
+#define DECL_ENUM(v) v,
+#define DECL_STR(v)  #v,
 
 #define EPS     FLT_EPSILON
 #define INF     INFINITY
@@ -45,7 +56,7 @@ typedef unsigned char   uint8;
 typedef unsigned short  uint16;
 typedef unsigned int    uint32;
 
-#define FOURCC(str)     (*((uint32*)str))
+#define FOURCC(str)     uint32(((uint8*)(str))[0] | (((uint8*)(str))[1] << 8) | (((uint8*)(str))[2] << 16) | (((uint8*)(str))[3] << 24) )
 
 #define COUNT(arr)      (sizeof(arr) / sizeof(arr[0]))
 
@@ -54,9 +65,19 @@ inline const T& min(const T &a, const T &b) {
     return a < b ? a : b;
 }
 
+template <typename T>
+inline const T& min(const T &a, const T &b, const T &c) {
+    return (a < b && a < c) ? a : ((b < a && b < c) ? b : c);
+}
+
 template <class T>
 inline const T& max(const T &a, const T &b) {
     return a > b ? a : b;
+}
+
+template <typename T>
+inline const T& max(const T &a, const T &b, const T &c) {
+    return (a > b && a > c) ? a : ((b > a && b > c) ? b : c);
 }
 
 template <class T>
@@ -76,10 +97,12 @@ inline void swap(T &a, T &b) {
     b = tmp;
 }
 
-float lerp(float a, float b, float t) {
-    if (t <= 0.0f) return a;
-    if (t >= 1.0f) return b;
-    return a + (b - a) * t; 
+inline uint16 swap16(uint16 x) {
+    return ((x & 0x00FF) << 8) | ((x & 0xFF00) >> 8);
+}
+
+inline uint32 swap32(uint32 x) {
+    return ((x & 0x000000FF) << 24) | ((x & 0x0000FF00) << 8) | ((x & 0x00FF0000) >> 8) | ((x & 0xFF000000) >> 24);
 }
 
 float clampAngle(float a) {
@@ -102,13 +125,29 @@ int angleQuadrant(float angle) {
 }
 
 float decrease(float delta, float &value, float &speed) {
-    if (speed > 0.0f && fabsf(delta) > 0.01f) {
+    if (speed > 0.0f && fabsf(delta) > 0.001f) {
         if (delta > 0) speed = min(delta,  speed);
         if (delta < 0) speed = max(delta, -speed);
         value += speed;
         return speed;
     } else
         return 0.0f;
+}
+
+float hermite(float x) {
+    return x * x * (3.0f - 2.0f * x);
+}
+
+float lerp(float a, float b, float t) {
+    if (t <= 0.0f) return a;
+    if (t >= 1.0f) return b;
+    return a + (b - a) * t; 
+}
+
+float lerpAngle(float a, float b, float t) {
+    if (t <= 0.0f) return a;
+    if (t >= 1.0f) return b;
+    return a + shortAngle(a, b) * t; 
 }
 
 int nextPow2(uint32 x) {
@@ -123,9 +162,9 @@ int nextPow2(uint32 x) {
 }
 
 uint32 fnv32(const char *data, int32 size, uint32 hash = 0x811c9dc5) {
-	for (int i = 0; i < size; i++)
-		hash = (hash ^ data[i]) * 0x01000193;
-	return hash;
+    for (int i = 0; i < size; i++)
+        hash = (hash ^ data[i]) * 0x01000193;
+    return hash;
 }
 
 struct vec2 {
@@ -140,6 +179,8 @@ struct vec2 {
     inline bool operator != (const vec2 &v) const { return !(*this == v); }
     inline bool operator == (float s)       const { return x == s && y == s; }
     inline bool operator != (float s)       const { return !(*this == s); }
+    inline bool operator <  (const vec2 &v) const { return x < v.x && y < v.y; }
+    inline bool operator >  (const vec2 &v) const { return x > v.x && y > v.y; }
     inline vec2 operator -  ()              const { return vec2(-x, -y); }
 
     vec2& operator += (const vec2 &v) { x += v.x; y += v.y; return *this; }
@@ -165,6 +206,7 @@ struct vec2 {
 
     float length2() const { return dot(*this); }
     float length()  const { return sqrtf(length2()); }
+    vec2  abs()     const { return vec2(fabsf(x), fabsf(y)); }
     vec2  normal()  const { float s = length(); return s == 0.0 ? (*this) : (*this)*(1.0f/s); }
     float angle()   const { return atan2f(y, x); }
     vec2& rotate(const vec2 &cs) { *this = vec2(x*cs.x - y*cs.y, x*cs.y + y*cs.x); return *this; }
@@ -173,8 +215,8 @@ struct vec2 {
 
 struct vec3 {
     union {
-        struct { vec2 xy; };
         struct { float x, y, z; };
+        struct { vec2 xy; };
     };
 
     vec3() {}
@@ -189,6 +231,8 @@ struct vec3 {
     inline bool operator != (const vec3 &v) const { return !(*this == v); }
     inline bool operator == (float s)       const { return x == s && y == s && z == s; }
     inline bool operator != (float s)       const { return !(*this == s); }
+    inline bool operator <  (const vec3 &v) const { return x < v.x && y < v.y && z < v.z; }
+    inline bool operator >  (const vec3 &v) const { return x > v.x && y > v.y && z > v.z; }
     inline vec3 operator -  ()              const { return vec3(-x, -y, -z); }
 
     vec3& operator += (const vec3 &v) { x += v.x; y += v.y; z += v.z; return *this; }
@@ -214,8 +258,13 @@ struct vec3 {
 
     float length2() const { return dot(*this); }
     float length()  const { return sqrtf(length2()); }
+    vec3  abs()     const { return vec3(fabsf(x), fabsf(y), fabsf(z)); }
     vec3  normal()  const { float s = length(); return s == 0.0f ? (*this) : (*this)*(1.0f/s); }
     vec3  axisXZ()  const { return (fabsf(x) > fabsf(z)) ? vec3(float(sign(x)), 0, 0) : vec3(0, 0, float(sign(z))); }
+
+    vec3 reflect(const vec3 &n) const {
+        return *this - n * (dot(n) * 2.0f);
+    }
 
     vec3 lerp(const vec3 &v, const float t) const {
         if (t <= 0.0f) return *this;
@@ -228,23 +277,29 @@ struct vec3 {
         return vec3(x*c - z*s, y, x*s + z*c);
     }
 
-    float angle(const vec3 &v) {
+    float angle(const vec3 &v) const {
         return dot(v) / (length() * v.length());
     }
+
+    float angleY() const { return atan2f(z, x); }
 };
 
 struct vec4 {
     union {
+        struct { float x, y, z, w; };
         struct { vec2 xy, zw; };
         struct { vec3 xyz; };
-        struct { float x, y, z, w; };
     };
 
     vec4() {}
     vec4(float s) : x(s), y(s), z(s), w(s) {}
     vec4(float x, float y, float z, float w) : x(x), y(y), z(z), w(w) {}
+    vec4(const vec3 &xyz) : x(xyz.x), y(xyz.y), z(xyz.z), w(0) {}
     vec4(const vec3 &xyz, float w) : x(xyz.x), y(xyz.y), z(xyz.z), w(w) {}
     vec4(const vec2 &xy, const vec2 &zw) : x(xy.x), y(xy.y), z(zw.x), w(zw.y) {}
+
+    inline bool operator == (const vec4 &v) const { return x == v.x && y == v.y && z == v.z && w == v.w; }
+    inline bool operator != (const vec4 &v) const { return !(*this == v); }
 
     vec4 operator + (const vec4 &v) const { return vec4(x + v.x, y + v.y, z + v.z, w + v.w); }
     vec4 operator - (const vec4 &v) const { return vec4(x - v.x, y - v.y, z - v.z, w - v.w); }
@@ -411,8 +466,13 @@ struct mat4 {
     mat4(float fov, float aspect, float znear, float zfar) {
         float k = 1.0f / tanf(fov * 0.5f * DEG2RAD);
         identity();
-        e00 = k / aspect;
-        e11 = k;
+        if (aspect >= 1.0f) {
+            e00 = k / aspect;
+            e11 = k;
+        } else {
+            e00 = k;
+            e11 = k * aspect;
+        }
         e22 = (znear + zfar) / (znear - zfar);
         e33 = 0.0f;
         e32 = -1.0f;
@@ -569,7 +629,7 @@ struct mat4 {
     quat getRot() const {
         float t, s;
         t = 1.0f + e00 + e11 + e22;
-        if (t > EPS) {
+        if (t > 0.0001f) {
             s = 0.5f / sqrtf(t);
             return quat((e21 - e12) * s, (e02 - e20) * s, (e10 - e01) * s, 0.25f / s);
         } else
@@ -624,7 +684,7 @@ struct mat4 {
 };
 
 struct Basis {
-	quat    rot;
+    quat    rot;
     vec3    pos;
     float   w;
 
@@ -681,12 +741,29 @@ struct short2 {
 
 struct short3 {
     int16 x, y, z;
+
+    short3() {}
+    short3(int16 x, int16 y, int16 z) : x(x), y(y), z(z) {}
+
+    operator vec3() const { return vec3((float)x, (float)y, (float)z); };
+
+    short3 operator + (const short3 &v) const { return short3(x + v.x, y + v.y, z + v.z); }
+    short3 operator - (const short3 &v) const { return short3(x - v.x, y - v.y, z - v.z); }
 };
 
 struct short4 {
     int16 x, y, z, w;
 
-    operator vec3() const { return vec3((float)x, (float)y, (float)z); };
+    short4() {}
+    short4(int16 x, int16 y, int16 z, int16 w) : x(x), y(y), z(z), w(w) {}
+
+    operator vec3()   const { return vec3((float)x, (float)y, (float)z); };
+    operator short3() const { return *((short3*)this); }
+
+    inline bool operator == (const short4 &v) const { return x == v.x && y == v.y && z == v.z && w == v.w; }
+    inline bool operator != (const short4 &v) const { return !(*this == v); }
+
+    inline int16& operator [] (int index) const { ASSERT(index >= 0 && index <= 3); return ((int16*)this)[index]; }
 };
 
 quat rotYXZ(const vec3 &a) {
@@ -711,6 +788,41 @@ vec3 boxNormal(int x, int z) {
     else
         return x < z ? vec3(-1, 0, 0) : vec3(0, 0, -1);
 }
+
+
+struct Sphere {
+    vec3  center;
+    float radius;
+
+    Sphere() {}
+    Sphere(const vec3 &center, float radius) : center(center), radius(radius) {}
+
+    bool intersect(const Sphere &s) const {
+        float d = (center - s.center).length2();
+        float r = (radius + s.radius);
+        return d < r * r;
+    }
+
+    bool intersect(const vec3 &rayPos, const vec3 &rayDir, float &t) const {
+        vec3 v = rayPos - center;
+        float h = -v.dot(rayDir);
+        float d = h * h + radius * radius - v.length2();
+
+        if (d > 0.0f) {
+            d = sqrtf(d);
+            float tMin = h - d;
+            float tMax = h + d;
+            if (tMax > 0.0f) {
+                if (tMin < 0.0f)
+                    tMin = 0.0f;
+                t = tMin;
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
 
 struct Box {
     vec3 min, max;
@@ -806,39 +918,112 @@ struct Box {
         }
     }
 
+    void translate(const vec3 &offset) {
+        min += offset;
+        max += offset;
+    }
+
+    vec3 closestPoint(const vec3 &p) const {
+        return vec3(clamp(p.x, min.x, max.x),
+                    clamp(p.y, min.y, max.y),
+                    clamp(p.z, min.z, max.z));
+    }
+
+    bool contains(const vec3 &v) const {
+        return v.x >= min.x && v.x <= max.x && v.y >= min.y && v.y <= max.y && v.z >= min.z && v.z <= max.z;
+    }
+
+    vec3 pushOut2D(const vec3 &v) const {
+        float ax = v.x - min.x;
+        float bx = max.x - v.x;
+        float az = v.z - min.z;
+        float bz = max.z - v.z;
+
+        vec3 p = vec3(0.0f);
+        if (ax <= bx && ax <= az && ax <= bz)
+            p.x = -ax;
+        else if (bx <= ax && bx <= az && bx <= bz)
+            p.x =  bx;
+        else if (az <= ax && az <= bx && az <= bz)
+            p.z = -az;
+        else
+            p.z =  bz;
+
+        return p;
+    }
+
+    vec3 pushOut2D(const Box &b) const {
+        float ax = b.max.x - min.x;
+        float bx = max.x - b.min.x;
+        float az = b.max.z - min.z;
+        float bz = max.z - b.min.z;
+
+        vec3 p = vec3(0.0f);
+        if (ax <= bx && ax <= az && ax <= bz)
+            p.x -= ax;
+        else if (bx <= ax && bx <= az && bx <= bz)
+            p.x += bx;
+        else if (az <= ax && az <= bx && az <= bz)
+            p.z -= az;
+        else
+            p.z += bz;
+
+        return p;
+    }
+
     bool intersect(const Box &box) const {
         return !((max.x < box.min.x || min.x > box.max.x) || (max.y < box.min.y || min.y > box.max.y) || (max.z < box.min.z || min.z > box.max.z));
     }
 
-    bool intersect(const vec3 &rayPos, const vec3 &rayDir, float &t) const {
-	    float t1 = INF, t0 = -t1;
+    bool intersect(const Sphere &sphere) const {
+        if (contains(sphere.center))
+            return true;
+        vec3 dir = sphere.center - closestPoint(sphere.center);
+        return (dir.length2() < sphere.radius * sphere.radius);
+    }
 
-	    for (int i = 0; i < 3; i++) 
-		    if (rayDir[i] != 0) {
-			    float lo = (min[i] - rayPos[i]) / rayDir[i];
-			    float hi = (max[i] - rayPos[i]) / rayDir[i];
-			    t0 = ::max(t0, ::min(lo, hi));
-			    t1 = ::min(t1, ::max(lo, hi));
-		    } else
-			    if (rayPos[i] < min[i] || rayPos[i] > max[i])
-				    return false;
-	    t = t0;
-	    return (t0 <= t1) && (t1 > 0);
+    bool intersect(const vec3 &rayPos, const vec3 &rayDir, float &t) const {
+        float tMax = INF, tMin = -tMax;
+
+        for (int i = 0; i < 3; i++) 
+            if (rayDir[i] != 0) {
+                float lo = (min[i] - rayPos[i]) / rayDir[i];
+                float hi = (max[i] - rayPos[i]) / rayDir[i];
+                tMin = ::max(tMin, ::min(lo, hi));
+                tMax = ::min(tMax, ::max(lo, hi));
+            } else
+                if (rayPos[i] < min[i] || rayPos[i] > max[i])
+                    return false;
+        t = tMin;
+        return (tMin <= tMax) && (tMax > 0.0f);
+    }
+
+    bool intersect(const mat4 &matrix, const vec3 &rayPos, const vec3 &rayDir, float &t) const {
+        mat4 mInv = matrix.inverse();
+        return intersect(mInv * rayPos, (mInv * vec4(rayDir, 0)).xyz, t);
     }
 };
+
 
 struct Stream {
     static char cacheDir[255];
     static char contentDir[255];
 
+    typedef void (Callback)(Stream *stream, void *userData);
+    Callback    *callback;
+    void        *userData;
+
     FILE        *f;
-    const char	*data;
+    char        *data;
+    char        *name;
     int         size, pos;
 
-    Stream(const void *data, int size) : f(NULL), data((char*)data), size(size), pos(0) {}
+    enum Endian { eLittle, eBig } endian;
 
-    Stream(const char *name) : data(NULL), size(-1), pos(0) {
-        if (contentDir[0]) {
+    Stream(const void *data, int size) : callback(NULL), userData(NULL), f(NULL), data((char*)data), name(NULL), size(size), pos(0), endian(eLittle) {}
+
+    Stream(const char *name, Callback *callback = NULL, void *userData = NULL) : callback(callback), userData(userData), data(NULL), name(NULL), size(-1), pos(0), endian(eLittle) {
+        if (contentDir[0] && (!cacheDir[0] || !strstr(name, cacheDir))) {
             char path[255];
             path[0] = 0;
             strcat(path, contentDir);
@@ -847,19 +1032,43 @@ struct Stream {
         } else
             f = fopen(name, "rb");
 
-        if (!f) LOG("error loading file \"%s\"\n", name);
-        ASSERT(f != NULL);
+        if (!f) {
+            #ifdef __EMSCRIPTEN__
+                this->name = new char[64];
+                strcpy(this->name, name);
 
-        fseek(f, 0, SEEK_END);
-        size = ftell(f);
-        fseek(f, 0, SEEK_SET);
+                extern void osDownload(Stream *stream);
+                osDownload(this);
+                return;
+            #else
+                LOG("error loading file \"%s\"\n", name);
+                if (callback) {
+                    callback(NULL, userData);
+                    delete this;
+                    return;
+                } else {
+                    ASSERT(false);
+                }
+            #endif
+        } else {
+            fseek(f, 0, SEEK_END);
+            size = ftell(f);
+            fseek(f, 0, SEEK_SET);
+
+            this->name = new char[strlen(name) + 1];
+            strcpy(this->name, name);
+
+            if (callback)
+                callback(this, userData);
+        }
     }
 
     ~Stream() {
+        delete[] name;
         if (f) fclose(f);
     }
 
-    static bool fileExists(const char *name) {
+    static bool exists(const char *name) {
         FILE *f = fopen(name, "rb");
         if (!f)
             return false;
@@ -868,11 +1077,15 @@ struct Stream {
         return true;
     }
 
+    static bool existsContent(const char *name) {
+        char fileName[1024];
+        strcpy(fileName, Stream::contentDir);
+        strcat(fileName, name);
+        return exists(fileName);
+    }
+
     static void write(const char *name, const void *data, int size) {
-        FILE *f = fopen(name, "wb");
-        if (!f) return;
-        fwrite(data, size, 1, f);
-        fclose(f);
+        osSave(name, data, size);
     }
 
     void setPos(int pos) {
@@ -898,6 +1111,12 @@ struct Stream {
     template <typename T>
     inline T& read(T &x) {
         raw(&x, sizeof(x));
+    /*
+        if (endian == eBig) {
+            if (sizeof(T) == 2) x = T(swap16(x));
+            if (sizeof(T) == 4) x = T(swap32(x));
+        }
+    */
         return x;
     }
 
@@ -912,4 +1131,58 @@ struct Stream {
     }
 };
 
-#endif 
+
+struct BitStream {
+    uint8 *data;
+    uint8 *end;
+    uint8 index;
+    uint8 value;
+
+    BitStream(uint8 *data, int size) : data(data), end(data + size), index(0), value(0) {}
+
+    uint8 readBits(int count) {
+        uint32 bits = 0;
+
+        while (count--) {
+            if (!index) {
+                ASSERT(data < end);
+                value = *data++;
+                index = 8;
+            }
+
+            bits <<= 1;
+
+            if (value & 0x80)
+                bits |= 1;
+
+            value <<= 1;
+            index--;
+        }
+
+        return bits;
+    }
+
+    uint8 readBit() {
+        return readBits(1);
+    }
+
+    uint8 readByte() {
+        return *data++;
+    }
+};
+
+
+namespace String {
+
+    void toLower(char *str) {
+        if (!str) return;
+
+        while (char &c = *str++) {
+            if (c >= 'A' && c <= 'Z')
+                c -= 'Z' - 'z';
+        }
+    }
+
+}
+
+#endif

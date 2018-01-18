@@ -1,6 +1,5 @@
 #include "game.h"
 
-bool isQuit = false;
 WindowRef window;
 AGLContext context;
 
@@ -42,7 +41,7 @@ void soundInit() {
 // common input functions
 InputKey keyToInputKey(int code) {
     static const int codes[] = {
-        0x7B, 0x7C, 0x7E, 0x7D, 0x31, 0x24, 0x35, 0x38, 0x3B, 0x3A,
+        0x7B, 0x7C, 0x7E, 0x7D, 0x31, 0x30, 0x24, 0x35, 0x38, 0x3B, 0x3A,
         0x1D, 0x12, 0x13, 0x14, 0x15, 0x17, 0x16, 0x1A, 0x1C, 0x19,                   // 0..9
         0x00, 0x0B, 0x08, 0x02, 0x0E, 0x03, 0x05, 0x04, 0x22, 0x26, 0x28, 0x25, 0x2E, // A..M
         0x2D, 0x1F, 0x23, 0x0C, 0x0F, 0x01, 0x11, 0x20, 0x09, 0x0D, 0x07, 0x10, 0x06, // N..Z
@@ -71,7 +70,7 @@ OSStatus eventHandler(EventHandlerCallRef handler, EventRef event, void* userDat
         case kEventClassWindow :
             switch (eventKind) {
                 case kEventWindowClosed :
-                    isQuit = true;
+                    Core::quit();
                     break;
                 case kEventWindowBoundsChanged : {
                     aglUpdateContext(context);
@@ -138,10 +137,14 @@ OSStatus eventHandler(EventHandlerCallRef handler, EventRef event, void* userDat
     return CallNextEventHandler(handler, event);
 }
 
-int getTime() {
+int osGetTime() {
     UInt64 t;
     Microseconds((UnsignedWide*)&t);
     return int(t / 1000);
+}
+
+bool osSave(const char *name, const void *data, int size) {
+    return false;
 }
 
 char Stream::contentDir[255];
@@ -197,22 +200,14 @@ int main() {
     SelectWindow(window);
     ShowWindow(window);
 
-    int lastTime = getTime(), fpsTime = lastTime + 1000, fps = 0;
-
     EventRecord event;
-    while (!isQuit)
-        if (!GetNextEvent(0xffff, &event)) {
-            int time = getTime();
-            if (time <= lastTime)
-                continue;
-            Game::update((time - lastTime) * 0.001f);
-            lastTime = time;
-
+    while (!Core::isQuit)
+        if (!GetNextEvent(0xffff, &event) && Game::update()) {
             Game::render();
             aglSwapBuffers(context);
         }
 
-    Game::free();
+    Game::deinit();
 	// TODO: sndFree
 
     aglSetCurrentContext(NULL);
